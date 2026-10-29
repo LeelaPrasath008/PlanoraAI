@@ -1,0 +1,532 @@
+{
+  "entities": {
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Public profile information for an authenticated Planora AI user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Strictly isolated PII document storing the user email address.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "Event": {
+      "title": "Event",
+      "description": "Core event plan record containing preferences, budget parameters, sharing settings, and AI concept summary.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1200
+        },
+        "eventType": {
+          "type": "string",
+          "enum": ["Wedding", "Birthday", "Anniversary", "College Event", "Festival", "Community"]
+        },
+        "eventDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "durationHours": {
+          "type": "number"
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "guestCount": {
+          "type": "number"
+        },
+        "totalBudget": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["INR", "USD", "EUR", "GBP"]
+        },
+        "themeStyle": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "venuePreference": {
+          "type": "string",
+          "enum": ["Indoor", "Outdoor", "Hybrid"]
+        },
+        "foodPreference": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "culturalNotes": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "mustHaves": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "avoidItems": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "priorities": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "contingencyPercent": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "archived", "completed"]
+        },
+        "isShared": {
+          "type": "boolean"
+        },
+        "shareToken": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "aiConceptSummary": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "aiRisksAndContingencies": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "title",
+        "description",
+        "eventType",
+        "eventDate",
+        "durationHours",
+        "city",
+        "guestCount",
+        "totalBudget",
+        "currency",
+        "themeStyle",
+        "venuePreference",
+        "foodPreference",
+        "culturalNotes",
+        "mustHaves",
+        "avoidItems",
+        "priorities",
+        "contingencyPercent",
+        "status",
+        "isShared",
+        "shareToken",
+        "aiConceptSummary",
+        "aiRisksAndContingencies",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BudgetItem": {
+      "title": "BudgetItem",
+      "description": "Budget category allocation and expense record for an event.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "plannedAmount": {
+          "type": "number"
+        },
+        "quotedAmount": {
+          "type": "number"
+        },
+        "actualAmount": {
+          "type": "number"
+        },
+        "lowEstimate": {
+          "type": "number"
+        },
+        "highEstimate": {
+          "type": "number"
+        },
+        "paymentStatus": {
+          "type": "string",
+          "enum": ["Paid", "Pending", "Unpaid"]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "eventId",
+        "ownerId",
+        "category",
+        "title",
+        "plannedAmount",
+        "quotedAmount",
+        "actualAmount",
+        "lowEstimate",
+        "highEstimate",
+        "paymentStatus",
+        "notes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TaskItem": {
+      "title": "TaskItem",
+      "description": "Timeline preparation task with due date, priority, optional dependency, and completion status.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "dueDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "durationDays": {
+          "type": "number"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["High", "Medium", "Low"]
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Todo", "In Progress", "Completed"]
+        },
+        "dependsOnTaskId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "assignee": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "eventId",
+        "ownerId",
+        "title",
+        "description",
+        "dueDate",
+        "priority",
+        "category",
+        "status",
+        "dependsOnTaskId",
+        "assignee",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "VendorItem": {
+      "title": "VendorItem",
+      "description": "Vendor checklist and quotation comparison entry.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "vendorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "contactInfo": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "estimatedPrice": {
+          "type": "number"
+        },
+        "quotedAmount": {
+          "type": "number"
+        },
+        "bookingStatus": {
+          "type": "string",
+          "enum": ["Shortlisted", "Inquiry Sent", "Quoted", "Booked", "Declined"]
+        },
+        "followUpDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 800
+        },
+        "isAiSuggestion": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "eventId",
+        "ownerId",
+        "category",
+        "vendorName",
+        "contactInfo",
+        "estimatedPrice",
+        "quotedAmount",
+        "bookingStatus",
+        "followUpDate",
+        "notes",
+        "isAiSuggestion",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "IdeaItem": {
+      "title": "IdeaItem",
+      "description": "Creative event recommendation across decor, food, entertainment, invitations, and activities.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["Decor", "Food & Beverage", "Entertainment", "Invitations", "Activities"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 800
+        },
+        "estimatedCostImpact": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "executionTip": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "eventId",
+        "ownerId",
+        "category",
+        "title",
+        "description",
+        "estimatedCostImpact",
+        "executionTip",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CopilotMessage": {
+      "title": "CopilotMessage",
+      "description": "AI Planning Copilot conversation message for a specific event.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant"]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "suggestedActionLabel": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["eventId", "ownerId", "role", "content", "suggestedActionLabel", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/public/{docId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "Public profile document for a user."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Private PII document for a user."
+    },
+    "/events/{eventId}": {
+      "schema": { "$ref": "#/entities/Event" },
+      "description": "Top-level event planning documents owned by users."
+    },
+    "/events/{eventId}/budgetItems/{itemId}": {
+      "schema": { "$ref": "#/entities/BudgetItem" },
+      "description": "Budget categories and expenses belonging to an event."
+    },
+    "/events/{eventId}/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/TaskItem" },
+      "description": "Timeline and preparation tasks belonging to an event."
+    },
+    "/events/{eventId}/vendors/{vendorId}": {
+      "schema": { "$ref": "#/entities/VendorItem" },
+      "description": "Vendors and quotations belonging to an event."
+    },
+    "/events/{eventId}/ideas/{ideaId}": {
+      "schema": { "$ref": "#/entities/IdeaItem" },
+      "description": "Creative ideas belonging to an event."
+    },
+    "/events/{eventId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/CopilotMessage" },
+      "description": "AI Planning Copilot messages belonging to an event."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Aurelia Event Studio",
+  "description": "GenAI-powered event planning workspace for organizing weddings, milestone birthdays, and community gatherings with interactive budgets, production timelines, vendor checklists, and bespoke creative concepts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

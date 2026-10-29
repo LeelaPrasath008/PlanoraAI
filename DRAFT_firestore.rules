@@ -1,0 +1,428 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 4.1: Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Master Gate Helper for Event Subcollections
+    function isParentEventOwner(eventId) {
+      return exists(/databases/$(database)/documents/events/$(eventId)) &&
+        get(/databases/$(database)/documents/events/$(eventId)).data.ownerId == request.auth.uid;
+    }
+
+    function isParentEventReadable(eventId) {
+      return exists(/databases/$(database)/documents/events/$(eventId)) && (
+        get(/databases/$(database)/documents/events/$(eventId)).data.ownerId == request.auth.uid ||
+        get(/databases/$(database)/documents/events/$(eventId)).data.isShared == true
+      );
+    }
+
+    // Validation Blueprint: UserPublicProfile
+    function isValidUserPublicProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+        data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: UserPrivateInfo (PII Isolated)
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+        data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: Event
+    function isValidEvent(data) {
+      return data.keys().hasAll([
+          'ownerId', 'title', 'description', 'eventType', 'eventDate', 'durationHours',
+          'city', 'guestCount', 'totalBudget', 'currency', 'themeStyle', 'venuePreference',
+          'foodPreference', 'culturalNotes', 'mustHaves', 'avoidItems', 'priorities',
+          'contingencyPercent', 'status', 'isShared', 'shareToken', 'aiConceptSummary',
+          'aiRisksAndContingencies', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'title', 'description', 'eventType', 'eventDate', 'durationHours',
+          'city', 'guestCount', 'totalBudget', 'currency', 'themeStyle', 'venuePreference',
+          'foodPreference', 'culturalNotes', 'mustHaves', 'avoidItems', 'priorities',
+          'contingencyPercent', 'status', 'isShared', 'shareToken', 'aiConceptSummary',
+          'aiRisksAndContingencies', 'createdAt', 'updatedAt'
+        ]) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.description is string && data.description.size() <= 1200 &&
+        data.eventType is string && data.eventType.size() <= 32 &&
+        data.eventType in ['Wedding', 'Birthday', 'Anniversary', 'College Event', 'Festival', 'Community'] &&
+        data.eventDate is string && data.eventDate.size() >= 1 && data.eventDate.size() <= 32 &&
+        data.durationHours is number && data.durationHours >= 1 && data.durationHours <= 240 &&
+        data.city is string && data.city.size() >= 1 && data.city.size() <= 120 &&
+        data.guestCount is number && data.guestCount >= 1 && data.guestCount <= 100000 &&
+        data.totalBudget is number && data.totalBudget >= 0 && data.totalBudget <= 1000000000 &&
+        data.currency is string && data.currency.size() <= 8 &&
+        data.currency in ['INR', 'USD', 'EUR', 'GBP'] &&
+        data.themeStyle is string && data.themeStyle.size() <= 300 &&
+        data.venuePreference is string && data.venuePreference.size() <= 16 &&
+        data.venuePreference in ['Indoor', 'Outdoor', 'Hybrid'] &&
+        data.foodPreference is string && data.foodPreference.size() <= 400 &&
+        data.culturalNotes is string && data.culturalNotes.size() <= 500 &&
+        data.mustHaves is string && data.mustHaves.size() <= 500 &&
+        data.avoidItems is string && data.avoidItems.size() <= 500 &&
+        data.priorities is string && data.priorities.size() <= 300 &&
+        data.contingencyPercent is number && data.contingencyPercent >= 0 && data.contingencyPercent <= 50 &&
+        data.status is string && data.status.size() <= 16 &&
+        data.status in ['active', 'archived', 'completed'] &&
+        data.isShared is bool &&
+        data.shareToken is string && data.shareToken.size() <= 64 &&
+        data.aiConceptSummary is string && data.aiConceptSummary.size() <= 2000 &&
+        data.aiRisksAndContingencies is string && data.aiRisksAndContingencies.size() <= 2000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: BudgetItem
+    function isValidBudgetItem(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'ownerId', 'category', 'title', 'plannedAmount', 'quotedAmount',
+          'actualAmount', 'lowEstimate', 'highEstimate', 'paymentStatus', 'notes',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'ownerId', 'category', 'title', 'plannedAmount', 'quotedAmount',
+          'actualAmount', 'lowEstimate', 'highEstimate', 'paymentStatus', 'notes',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 &&
+        data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.plannedAmount is number && data.plannedAmount >= 0 &&
+        data.quotedAmount is number && data.quotedAmount >= 0 &&
+        data.actualAmount is number && data.actualAmount >= 0 &&
+        data.lowEstimate is number && data.lowEstimate >= 0 &&
+        data.highEstimate is number && data.highEstimate >= 0 &&
+        data.paymentStatus is string && data.paymentStatus.size() <= 16 &&
+        data.paymentStatus in ['Paid', 'Pending', 'Unpaid'] &&
+        data.notes is string && data.notes.size() <= 600 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: TaskItem
+    function isValidTaskItem(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'ownerId', 'title', 'description', 'dueDate', 'priority',
+          'category', 'status', 'dependsOnTaskId', 'assignee', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'ownerId', 'title', 'description', 'dueDate', 'priority',
+          'category', 'status', 'dependsOnTaskId', 'assignee', 'createdAt', 'updatedAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 &&
+        data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.description is string && data.description.size() <= 600 &&
+        data.dueDate is string && data.dueDate.size() >= 1 && data.dueDate.size() <= 32 &&
+        data.priority is string && data.priority.size() <= 16 &&
+        data.priority in ['High', 'Medium', 'Low'] &&
+        data.category is string && data.category.size() <= 80 &&
+        data.status is string && data.status.size() <= 16 &&
+        data.status in ['Todo', 'In Progress', 'Completed'] &&
+        data.dependsOnTaskId is string && data.dependsOnTaskId.size() <= 128 &&
+        data.assignee is string && data.assignee.size() <= 100 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: VendorItem
+    function isValidVendorItem(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'ownerId', 'category', 'vendorName', 'contactInfo',
+          'estimatedPrice', 'quotedAmount', 'bookingStatus', 'followUpDate',
+          'notes', 'isAiSuggestion', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'ownerId', 'category', 'vendorName', 'contactInfo',
+          'estimatedPrice', 'quotedAmount', 'bookingStatus', 'followUpDate',
+          'notes', 'isAiSuggestion', 'createdAt', 'updatedAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 &&
+        data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+        data.vendorName is string && data.vendorName.size() >= 1 && data.vendorName.size() <= 140 &&
+        data.contactInfo is string && data.contactInfo.size() <= 200 &&
+        data.estimatedPrice is number && data.estimatedPrice >= 0 &&
+        data.quotedAmount is number && data.quotedAmount >= 0 &&
+        data.bookingStatus is string && data.bookingStatus.size() <= 24 &&
+        data.bookingStatus in ['Shortlisted', 'Inquiry Sent', 'Quoted', 'Booked', 'Declined'] &&
+        data.followUpDate is string && data.followUpDate.size() <= 32 &&
+        data.notes is string && data.notes.size() <= 800 &&
+        data.isAiSuggestion is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: IdeaItem
+    function isValidIdeaItem(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'ownerId', 'category', 'title', 'description',
+          'estimatedCostImpact', 'executionTip', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'ownerId', 'category', 'title', 'description',
+          'estimatedCostImpact', 'executionTip', 'createdAt', 'updatedAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 &&
+        data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.category is string && data.category.size() <= 32 &&
+        data.category in ['Decor', 'Food & Beverage', 'Entertainment', 'Invitations', 'Activities'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.description is string && data.description.size() <= 800 &&
+        data.estimatedCostImpact is string && data.estimatedCostImpact.size() <= 120 &&
+        data.executionTip is string && data.executionTip.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: CopilotMessage
+    function isValidCopilotMessage(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'ownerId', 'role', 'content', 'suggestedActionLabel', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'ownerId', 'role', 'content', 'suggestedActionLabel', 'createdAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 &&
+        data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.role is string && data.role.size() <= 16 &&
+        data.role in ['user', 'assistant'] &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 4000 &&
+        data.suggestedActionLabel is string && data.suggestedActionLabel.size() <= 200 &&
+        data.createdAt is timestamp;
+    }
+
+    // Collection 1: Public User Profile
+    match /users/{userId}/public/{docId} {
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) && request.auth.uid == userId;
+      allow create: if isVerified() && isValidId(userId) && isValidId(docId) &&
+        request.auth.uid == userId &&
+        isValidUserPublicProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidUserPublicProfile(incoming()) &&
+        isValidId(userId) && isValidId(docId) &&
+        request.auth.uid == userId &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+    }
+
+    // Collection 2: Private User Info (PII Split Collection Strategy)
+    match /users/{userId}/private/{docId} {
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) && request.auth.uid == userId;
+      allow create: if isVerified() && isValidId(userId) && isValidId(docId) &&
+        request.auth.uid == userId &&
+        isValidUserPrivateInfo(incoming()) &&
+        incoming().createdAt == request.time;
+    }
+
+    // Collection 3: Events Master Collection
+    match /events/{eventId} {
+      allow get: if isSignedIn() && isValidId(eventId) && (
+        existing().ownerId == request.auth.uid || existing().isShared == true
+      );
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerified() && isValidId(eventId) &&
+        isValidEvent(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidEvent(incoming()) &&
+        isValidId(eventId) &&
+        existing().ownerId == request.auth.uid &&
+        existing().status != 'completed' &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Update core details, budget, scenario simulator parameters, or AI summaries
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'description', 'eventType', 'eventDate', 'durationHours', 'city',
+            'guestCount', 'totalBudget', 'currency', 'themeStyle', 'venuePreference',
+            'foodPreference', 'culturalNotes', 'mustHaves', 'avoidItems', 'priorities',
+            'contingencyPercent', 'status', 'isShared', 'shareToken', 'aiConceptSummary',
+            'aiRisksAndContingencies', 'updatedAt'
+          ])
+        );
+      allow delete: if isVerified() && isValidId(eventId) && existing().ownerId == request.auth.uid;
+
+      // Subcollection 3A: Budget Items
+      match /budgetItems/{itemId} {
+        allow get: if isSignedIn() && isValidId(eventId) && isValidId(itemId) && isParentEventReadable(eventId);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(eventId) && isValidId(itemId) &&
+          isValidBudgetItem(incoming(), eventId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isParentEventOwner(eventId);
+        allow update: if isVerified() && isValidBudgetItem(incoming(), eventId) &&
+          isValidId(eventId) && isValidId(itemId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().eventId == existing().eventId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'category', 'title', 'plannedAmount', 'quotedAmount', 'actualAmount',
+            'lowEstimate', 'highEstimate', 'paymentStatus', 'notes', 'updatedAt'
+          ]) &&
+          isParentEventOwner(eventId);
+        allow delete: if isVerified() && isValidId(eventId) && isValidId(itemId) &&
+          existing().ownerId == request.auth.uid &&
+          isParentEventOwner(eventId);
+      }
+
+      // Subcollection 3B: Tasks
+      match /tasks/{taskId} {
+        allow get: if isSignedIn() && isValidId(eventId) && isValidId(taskId) && isParentEventReadable(eventId);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(eventId) && isValidId(taskId) &&
+          isValidTaskItem(incoming(), eventId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isParentEventOwner(eventId);
+        allow update: if isVerified() && isValidTaskItem(incoming(), eventId) &&
+          isValidId(eventId) && isValidId(taskId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().eventId == existing().eventId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'description', 'dueDate', 'priority', 'category',
+            'status', 'dependsOnTaskId', 'assignee', 'updatedAt'
+          ]) &&
+          isParentEventOwner(eventId);
+        allow delete: if isVerified() && isValidId(eventId) && isValidId(taskId) &&
+          existing().ownerId == request.auth.uid &&
+          isParentEventOwner(eventId);
+      }
+
+      // Subcollection 3C: Vendors
+      match /vendors/{vendorId} {
+        allow get: if isSignedIn() && isValidId(eventId) && isValidId(vendorId) && isParentEventReadable(eventId);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(eventId) && isValidId(vendorId) &&
+          isValidVendorItem(incoming(), eventId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isParentEventOwner(eventId);
+        allow update: if isVerified() && isValidVendorItem(incoming(), eventId) &&
+          isValidId(eventId) && isValidId(vendorId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().eventId == existing().eventId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'category', 'vendorName', 'contactInfo', 'estimatedPrice', 'quotedAmount',
+            'bookingStatus', 'followUpDate', 'notes', 'isAiSuggestion', 'updatedAt'
+          ]) &&
+          isParentEventOwner(eventId);
+        allow delete: if isVerified() && isValidId(eventId) && isValidId(vendorId) &&
+          existing().ownerId == request.auth.uid &&
+          isParentEventOwner(eventId);
+      }
+
+      // Subcollection 3D: Creative Ideas
+      match /ideas/{ideaId} {
+        allow get: if isSignedIn() && isValidId(eventId) && isValidId(ideaId) && isParentEventReadable(eventId);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(eventId) && isValidId(ideaId) &&
+          isValidIdeaItem(incoming(), eventId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isParentEventOwner(eventId);
+        allow update: if isVerified() && isValidIdeaItem(incoming(), eventId) &&
+          isValidId(eventId) && isValidId(ideaId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().eventId == existing().eventId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'category', 'title', 'description', 'estimatedCostImpact', 'executionTip', 'updatedAt'
+          ]) &&
+          isParentEventOwner(eventId);
+        allow delete: if isVerified() && isValidId(eventId) && isValidId(ideaId) &&
+          existing().ownerId == request.auth.uid &&
+          isParentEventOwner(eventId);
+      }
+
+      // Subcollection 3E: AI Copilot Messages
+      match /messages/{messageId} {
+        allow get: if isSignedIn() && isValidId(eventId) && isValidId(messageId) && isParentEventReadable(eventId);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerified() && isValidId(eventId) && isValidId(messageId) &&
+          isValidCopilotMessage(incoming(), eventId) &&
+          incoming().createdAt == request.time &&
+          isParentEventOwner(eventId);
+        allow delete: if isVerified() && isValidId(eventId) && isValidId(messageId) &&
+          existing().ownerId == request.auth.uid &&
+          isParentEventOwner(eventId);
+      }
+    }
+  }
+}
