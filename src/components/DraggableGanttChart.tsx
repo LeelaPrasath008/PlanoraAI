@@ -18,6 +18,10 @@ import {
   SlidersHorizontal,
 } from 'lucide-react';
 import { PlanoraTask } from '../types/event';
+import {
+  wouldCreateCycle as checkCycle,
+  resolveScheduleOverlaps,
+} from '../utils/taskScheduler';
 
 interface DraggableGanttChartProps {
   tasks: PlanoraTask[];
@@ -81,14 +85,15 @@ type DragInteraction =
       hoveredTargetId: string | null;
     };
 
-export const DraggableGanttChart: React.FC<DraggableGanttChartProps> = ({
-  tasks,
-  eventDate,
-  isReadOnly,
-  onUpdateTask,
-  onBatchUpdateTasks,
-}) => {
-  const [zoomLevel, setZoomLevel] = useState<'fit' | 'comfortable' | 'detailed'>('comfortable');
+export const DraggableGanttChart: React.FC<DraggableGanttChartProps> = React.memo(
+  ({
+    tasks,
+    eventDate,
+    isReadOnly,
+    onUpdateTask,
+    onBatchUpdateTasks,
+  }) => {
+    const [zoomLevel, setZoomLevel] = useState<'fit' | 'comfortable' | 'detailed'>('comfortable');
   const [sortBy, setSortBy] = useState<'start' | 'chain' | 'due'>('chain');
   const [autoCascadeDependents, setAutoCascadeDependents] = useState<boolean>(true);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(
@@ -124,21 +129,9 @@ export const DraggableGanttChart: React.FC<DraggableGanttChartProps> = ({
 
   // Cycle check: would making `targetTaskId` depend on `candidatePrereqId` create a cycle?
   const wouldCreateCycle = useCallback(
-    (targetTaskId: string, candidatePrereqId: string): boolean => {
-      if (!candidatePrereqId) return false;
-      if (targetTaskId === candidatePrereqId) return true;
-      let curr = candidatePrereqId;
-      const visited = new Set<string>();
-      while (curr) {
-        if (curr === targetTaskId) return true;
-        if (visited.has(curr)) break;
-        visited.add(curr);
-        const parent = taskById.get(curr);
-        curr = parent?.dependsOnTaskId || '';
-      }
-      return false;
-    },
-    [taskById]
+    (targetTaskId: string, candidatePrereqId: string): boolean =>
+      checkCycle(tasks, targetTaskId, candidatePrereqId),
+    [tasks]
   );
 
   // Compute topological depth for chain sorting
@@ -536,43 +529,12 @@ export const DraggableGanttChart: React.FC<DraggableGanttChartProps> = ({
   // Auto-resolve all schedule overlaps with 1 click
   const handleResolveOverlaps = async () => {
     if (isReadOnly || scheduleOverlaps.length === 0) return;
-    const eventMaxMs = parseDateMs(eventDate);
-    const taskMap = new Map<string, PlanoraTask>();
-    tasks.forEach((t) => taskMap.set(t.id, { ...t }));
+    const { updatedTasks } = resolveScheduleOverlaps(tasks, eventDate);
 
-    for (let pass = 0; pass < tasks.length; pass++) {
-      let changed = false;
-      for (const cand of taskMap.values()) {
-        if (!cand.dependsOnTaskId) continue;
-        const prereq = taskMap.get(cand.dependsOnTaskId);
-        if (!prereq) continue;
-        const pDue = parseDateMs(prereq.dueDate);
-        const cDur = getTaskDuration(cand);
-        const cStart = getTaskStartMs(cand);
-        if (cStart < pDue) {
-          const nextStart = pDue + DAY_MS;
-          const nextDue = Math.min(eventMaxMs, nextStart + (cDur - 1) * DAY_MS);
-          const nextDueStr = formatDateYMD(nextDue);
-          if (nextDueStr !== cand.dueDate) {
-            taskMap.set(cand.id, {
-              ...cand,
-              dueDate: nextDueStr,
-              durationDays: cDur,
-            });
-            changed = true;
-          }
-        }
-      }
-      if (!changed) break;
-    }
-
-    const updatedAll = Array.from(taskMap.values());
     if (onBatchUpdateTasks) {
-      await onBatchUpdateTasks(updatedAll);
+      await onBatchUpdateTasks(updatedTasks);
     } else {
-      for (const u of updatedAll) {
-        await onUpdateTask(u);
-      }
+      await Promise.all(updatedTasks.map((u) => onUpdateTask(u)));
     }
     setToastBanner(
       'Aligned dependent task start dates to follow their upstream prerequisites.'
@@ -1346,4 +1308,4 @@ export const DraggableGanttChart: React.FC<DraggableGanttChartProps> = ({
       </div>
     </div>
   );
-};
+});

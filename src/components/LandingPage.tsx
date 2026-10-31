@@ -26,7 +26,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   isSigningIn,
 }) => {
   return (
-    <div className="min-h-screen bg-[#FAF8F5] text-slate-900 flex flex-col">
+    <div id="top" className="min-h-screen bg-[#FAF8F5] text-slate-900 flex flex-col">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:px-4 focus:py-2 focus:bg-[#1E1B4B] focus:text-white focus:rounded-lg focus:text-xs focus:font-semibold"
+      >
+        Skip to main content
+      </a>
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
       <header className="sticky top-0 z-30 bg-[#FAF8F5]/95 backdrop-blur-xs border-b border-slate-200 px-6 py-4 flex items-center justify-between gap-8">
         <a
@@ -80,7 +86,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         </div>
       </header>
 
-      <main className="flex-1 max-w-[1280px] w-full mx-auto px-6 py-12 space-y-20">
+      <main
+        id="main-content"
+        className="flex-1 max-w-[1280px] w-full mx-auto px-6 py-12 space-y-20"
+      >
         {/* Hero Split */}
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
           <motion.div

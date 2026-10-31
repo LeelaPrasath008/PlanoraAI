@@ -123,3 +123,28 @@ export const DIRTY_DOZEN_PAYLOADS: AdversarialTestCase[] = [
     expectedOutcome: 'PERMISSION_DENIED',
   },
 ];
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+describe('Firestore Security Rules & Dirty Dozen Adversarial Suite', () => {
+  it('defines all 12 Dirty Dozen adversarial payloads with PERMISSION_DENIED outcome', () => {
+    assert.equal(DIRTY_DOZEN_PAYLOADS.length, 12);
+    const ids = new Set(DIRTY_DOZEN_PAYLOADS.map((tc) => tc.id));
+    assert.equal(ids.size, 12);
+    for (const tc of DIRTY_DOZEN_PAYLOADS) {
+      assert.equal(tc.expectedOutcome, 'PERMISSION_DENIED');
+      assert.ok(tc.collectionPath.startsWith('/'));
+    }
+  });
+
+  it('enforces zero-trust invariants in firestore.rules', () => {
+    const rulesPath = path.resolve(process.cwd(), 'firestore.rules');
+    const rulesContent = fs.readFileSync(rulesPath, 'utf8');
+    assert.ok(rulesContent.includes("rules_version = '2'"));
+    assert.ok(rulesContent.includes('email_verified == true'));
+    assert.ok(rulesContent.includes('hasOnly'));
+  });
+});

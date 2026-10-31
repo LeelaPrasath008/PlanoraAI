@@ -5,15 +5,17 @@ import {
   PlanoraEvent,
   VenuePreference,
 } from '../types/event';
+import {
+  CateringTier,
+  simulateEventScenario,
+} from '../utils/budgetCalculations';
 
 interface ScenarioSimulatorProps {
   event: PlanoraEvent;
   onApplyScenario: (updatedEvent: PlanoraEvent) => void;
 }
 
-type CateringTier = 'Essential (-18%)' | 'Signature (Baseline)' | 'Luxury (+25%)';
-
-export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
+export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = React.memo(({
   event,
   onApplyScenario,
 }) => {
@@ -46,106 +48,20 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
     setSimPriorities(event.priorities);
     setAiAnalysis(null);
     setAppliedBanner(false);
-  }, [event.id]);
+  }, [event.id, event.guestCount, event.totalBudget, event.eventDate, event.venuePreference, event.priorities]);
 
   // Deterministic Application-Code Math for Scenario Comparison
-  const comparison = useMemo(() => {
-    const guestRatio = simGuests / Math.max(1, event.guestCount);
-    const tierMultiplier =
-      cateringTier === 'Essential (-18%)'
-        ? 0.82
-        : cateringTier === 'Luxury (+25%)'
-        ? 1.25
-        : 1.0;
-
-    const venueMultiplier =
-      simVenue === event.venuePreference
-        ? 1.0
-        : simVenue === 'Outdoor'
-        ? 1.08 // tenting / weather backup
-        : simVenue === 'Indoor'
-        ? 0.96
-        : 1.04;
-
-    const simulatedItems = event.budgetItems.map((item) => {
-      const catLower = item.category.toLowerCase();
-      let newPlanned = item.plannedAmount;
-
-      if (
-        catLower.includes('catering') ||
-        catLower.includes('food') ||
-        catLower.includes('invitation')
-      ) {
-        // Variable per-guest cost scaled by guestRatio and cateringTier
-        newPlanned = Math.round(
-          item.plannedAmount * guestRatio * tierMultiplier
-        );
-      } else if (catLower.includes('venue') || catLower.includes('rental')) {
-        // Semi-variable step scaling + venue type multiplier
-        const capacityFactor = 1 + (guestRatio - 1) * 0.45;
-        newPlanned = Math.round(
-          item.plannedAmount * Math.max(0.6, capacityFactor) * venueMultiplier
-        );
-      } else if (catLower.includes('decor')) {
-        const decorFactor = 1 + (guestRatio - 1) * 0.25;
-        newPlanned = Math.round(
-          item.plannedAmount * Math.max(0.7, decorFactor) * venueMultiplier
-        );
-      }
-
-      return {
-        ...item,
-        simulatedPlanned: Math.max(0, newPlanned),
-        delta: Math.max(0, newPlanned) - item.plannedAmount,
-      };
-    });
-
-    const currentTotalPlanned = event.budgetItems.reduce(
-      (s, i) => s + (Number(i.plannedAmount) || 0),
-      0
-    );
-    const currentContingency = Math.round(
-      event.totalBudget * (event.contingencyPercent / 100)
-    );
-    const currentRemaining =
-      event.totalBudget - currentTotalPlanned - currentContingency;
-
-    const projectedTotalSpend = simulatedItems.reduce(
-      (s, i) => s + i.simulatedPlanned,
-      0
-    );
-    const projectedContingency = Math.round(
-      simBudget * (event.contingencyPercent / 100)
-    );
-    const projectedRemaining =
-      simBudget - projectedTotalSpend - projectedContingency;
-
-    // Date shift calculation in days
-    const origMs = new Date(event.eventDate).getTime();
-    const simMs = new Date(simDate).getTime();
-    const dayShift =
-      Number.isFinite(origMs) && Number.isFinite(simMs)
-        ? Math.round((simMs - origMs) / (1000 * 60 * 60 * 24))
-        : 0;
-
-    return {
-      simulatedItems,
-      currentTotalPlanned,
-      currentContingency,
-      currentRemaining,
-      projectedTotalSpend,
-      projectedContingency,
-      projectedRemaining,
-      dayShift,
-    };
-  }, [
-    event,
-    simGuests,
-    simBudget,
-    simDate,
-    simVenue,
-    cateringTier,
-  ]);
+  const comparison = useMemo(
+    () =>
+      simulateEventScenario(event, {
+        simGuests,
+        simBudget,
+        simDate,
+        simVenue,
+        cateringTier,
+      }),
+    [event, simGuests, simBudget, simDate, simVenue, cateringTier]
+  );
 
   const handleRequestAiTradeOffs = async () => {
     setIsAnalyzing(true);
@@ -293,6 +209,7 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
             </div>
             <input
               type="range"
+              aria-label="Simulated Guest Count"
               min={10}
               max={Math.max(500, event.guestCount * 2)}
               step={5}
@@ -316,6 +233,7 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
             </div>
             <input
               type="range"
+              aria-label="Simulated Total Budget"
               min={Math.round(event.totalBudget * 0.4)}
               max={Math.round(event.totalBudget * 2)}
               step={Math.max(500, Math.round(event.totalBudget * 0.02))}
@@ -333,6 +251,7 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
               Catering & Hospitality Tier
             </label>
             <select
+              aria-label="Catering and Hospitality Tier"
               value={cateringTier}
               onChange={(e) => {
                 setCateringTier(e.target.value as CateringTier);
@@ -360,6 +279,7 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
             </label>
             <input
               type="date"
+              aria-label="Proposed Event Date"
               value={simDate}
               onChange={(e) => {
                 setSimDate(e.target.value);
@@ -411,6 +331,7 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
             </label>
             <input
               type="text"
+              aria-label="Priority Focus"
               value={simPriorities}
               onChange={(e) => setSimPriorities(e.target.value)}
               className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
@@ -584,4 +505,4 @@ export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
       </div>
     </section>
   );
-};
+});

@@ -19,6 +19,10 @@ import {
   Trash2,
 } from 'lucide-react';
 import { PlanoraTask } from '../types/event';
+import {
+  analyzeTaskDependencyGraph,
+  wouldCreateCycle as checkCycle,
+} from '../utils/taskScheduler';
 
 interface TaskDependencyGraphProps {
   tasks: PlanoraTask[];
@@ -49,14 +53,15 @@ const NODE_SPRING = {
   mass: 0.85,
 };
 
-export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
-  tasks,
-  isReadOnly = false,
-  initialSubMode = 'graph',
-  onUpdateTask,
-  onDeleteTask,
-}) => {
-  const [subMode, setSubMode] = useState<'graph' | 'tree'>(initialSubMode);
+export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = React.memo(
+  ({
+    tasks,
+    isReadOnly = false,
+    initialSubMode = 'graph',
+    onUpdateTask,
+    onDeleteTask,
+  }) => {
+    const [subMode, setSubMode] = useState<'graph' | 'tree'>(initialSubMode);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
   const [dependencyFilter, setDependencyFilter] = useState<
@@ -94,154 +99,17 @@ export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
   const nodeRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [edges, setEdges] = useState<EdgeCoord[]>([]);
 
-  const taskMap = useMemo(() => {
-    const map = new Map<string, PlanoraTask>();
-    tasks.forEach((t) => map.set(t.id, t));
-    return map;
-  }, [tasks]);
-
-  // Build adjacency lists (childrenMap: prereqId -> dependent tasks)
   const {
+    taskMap,
     childrenMap,
     downstreamCountMap,
     criticalPathIds,
     stages,
     stats,
-  } = useMemo(() => {
-    const cMap = new Map<string, PlanoraTask[]>();
-    tasks.forEach((t) => cMap.set(t.id, []));
-
-    tasks.forEach((t) => {
-      if (t.dependsOnTaskId && taskMap.has(t.dependsOnTaskId)) {
-        const list = cMap.get(t.dependsOnTaskId) || [];
-        list.push(t);
-        cMap.set(t.dependsOnTaskId, list);
-      }
-    });
-
-    // Compute topological depth for each task (with cycle protection)
-    const dMap = new Map<string, number>();
-    const computeDepth = (
-      taskId: string,
-      visited = new Set<string>()
-    ): number => {
-      if (dMap.has(taskId)) return dMap.get(taskId)!;
-      if (visited.has(taskId)) return 0;
-      visited.add(taskId);
-      const t = taskMap.get(taskId);
-      if (!t || !t.dependsOnTaskId || !taskMap.has(t.dependsOnTaskId)) {
-        dMap.set(taskId, 0);
-        return 0;
-      }
-      const d = 1 + computeDepth(t.dependsOnTaskId, visited);
-      dMap.set(taskId, d);
-      return d;
-    };
-
-    tasks.forEach((t) => computeDepth(t.id));
-
-    // Compute total transitive downstream tasks for each task
-    const dsCount = new Map<string, number>();
-    const getTransitiveDependents = (
-      taskId: string,
-      visited = new Set<string>()
-    ): Set<string> => {
-      const result = new Set<string>();
-      const direct = cMap.get(taskId) || [];
-      for (const child of direct) {
-        if (!visited.has(child.id)) {
-          visited.add(child.id);
-          result.add(child.id);
-          const sub = getTransitiveDependents(child.id, visited);
-          sub.forEach((id) => result.add(id));
-        }
-      }
-      return result;
-    };
-
-    tasks.forEach((t) => {
-      dsCount.set(t.id, getTransitiveDependents(t.id).size);
-    });
-
-    // Find longest chain (Critical Path)
-    let longestDepth = 0;
-    dMap.forEach((d) => {
-      if (d > longestDepth) longestDepth = d;
-    });
-
-    const critIds = new Set<string>();
-    tasks.forEach((t) => {
-      if ((dMap.get(t.id) || 0) === longestDepth && longestDepth > 0) {
-        let curr: PlanoraTask | undefined = t;
-        const seen = new Set<string>();
-        while (curr && !seen.has(curr.id)) {
-          seen.add(curr.id);
-          critIds.add(curr.id);
-          curr = curr.dependsOnTaskId
-            ? taskMap.get(curr.dependsOnTaskId)
-            : undefined;
-        }
-      }
-    });
-
-    // Group tasks by stage level
-    const stageGroups: PlanoraTask[][] = Array.from(
-      { length: longestDepth + 1 },
-      () => []
-    );
-    tasks.forEach((t) => {
-      const d = dMap.get(t.id) || 0;
-      stageGroups[d].push(t);
-    });
-    stageGroups.forEach((group) =>
-      group.sort((a, b) => a.dueDate.localeCompare(b.dueDate))
-    );
-
-    // Compute dependency intelligence metrics
-    let blockedCount = 0;
-    let readyCount = 0;
-    let bottleneckCount = 0;
-    let overdueCount = 0;
-
-    tasks.forEach((t) => {
-      const prereq = t.dependsOnTaskId
-        ? taskMap.get(t.dependsOnTaskId)
-        : undefined;
-      const isBlocked = Boolean(prereq && prereq.status !== 'Completed');
-      const isOverdue = t.status !== 'Completed' && t.dueDate < todayIso;
-      const dependents = cMap.get(t.id) || [];
-
-      if (t.status !== 'Completed') {
-        if (isOverdue) {
-          overdueCount += 1;
-        }
-        if (isBlocked) {
-          blockedCount += 1;
-        } else {
-          readyCount += 1;
-        }
-        if (dependents.length > 0) {
-          bottleneckCount += 1;
-        }
-      }
-    });
-
-    return {
-      childrenMap: cMap,
-      depthMap: dMap,
-      maxDepth: longestDepth,
-      downstreamCountMap: dsCount,
-      criticalPathIds: critIds,
-      stages: stageGroups,
-      stats: {
-        blockedCount,
-        readyCount,
-        bottleneckCount,
-        overdueCount,
-        stageCount: longestDepth + 1,
-      },
-    };
-  }, [tasks, taskMap, todayIso]);
+  } = useMemo(
+    () => analyzeTaskDependencyGraph(tasks, todayIso),
+    [tasks, todayIso]
+  );
 
   // Detect status changes, dependency connection updates, and newly unlocked downstream tasks
   useEffect(() => {
@@ -324,19 +192,9 @@ export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
 
   // Check if linking `taskId` to `candidatePrereqId` would create a cycle
   const wouldCreateCycle = useCallback(
-    (taskId: string, candidatePrereqId: string): boolean => {
-      if (!candidatePrereqId) return false;
-      if (taskId === candidatePrereqId) return true;
-      let curr = taskMap.get(candidatePrereqId);
-      const visited = new Set<string>();
-      while (curr && curr.dependsOnTaskId && !visited.has(curr.id)) {
-        visited.add(curr.id);
-        if (curr.dependsOnTaskId === taskId) return true;
-        curr = taskMap.get(curr.dependsOnTaskId);
-      }
-      return false;
-    },
-    [taskMap]
+    (taskId: string, candidatePrereqId: string): boolean =>
+      checkCycle(tasks, taskId, candidatePrereqId),
+    [tasks]
   );
 
   // Recalculate SVG edge coordinates whenever layout, tasks, filter, or window size changes
@@ -389,38 +247,28 @@ export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
     setEdges(nextEdges);
   }, [tasks, taskMap, subMode, criticalPathIds]);
 
-  // Smooth 60fps requestAnimationFrame edge tracking while nodes glide into new positions
-  const triggerSmoothEdgeTracking = useCallback(
-    (durationMs = 520) => {
-      let rafId = 0;
-      const start = performance.now();
-      const step = (now: number) => {
-        recomputeEdges();
-        if (now - start < durationMs) {
-          rafId = requestAnimationFrame(step);
-        }
-      };
-      rafId = requestAnimationFrame(step);
-      return () => cancelAnimationFrame(rafId);
-    },
-    [recomputeEdges]
-  );
-
+  // Event-driven edge measurement using a single RAF + post-transition settle + ResizeObserver (zero continuous RAF polling)
   useEffect(() => {
-    const cancel = triggerSmoothEdgeTracking(560);
+    if (subMode !== 'graph') return;
+    const rafId = requestAnimationFrame(recomputeEdges);
+    const settleTimer = window.setTimeout(recomputeEdges, 280);
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+      observer = new ResizeObserver(() => {
+        requestAnimationFrame(recomputeEdges);
+      });
+      observer.observe(containerRef.current);
+    }
+
     window.addEventListener('resize', recomputeEdges);
     return () => {
-      cancel();
+      cancelAnimationFrame(rafId);
+      window.clearTimeout(settleTimer);
+      observer?.disconnect();
       window.removeEventListener('resize', recomputeEdges);
     };
-  }, [
-    triggerSmoothEdgeTracking,
-    recomputeEdges,
-    tasks,
-    dependencyFilter,
-    subMode,
-    selectedTaskId,
-  ]);
+  }, [recomputeEdges, tasks, dependencyFilter, subMode, selectedTaskId]);
 
   const cycleTaskStatus = async (task: PlanoraTask) => {
     if (isReadOnly) return;
@@ -1252,9 +1100,9 @@ export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
                             ref={(el) => {
                               nodeRefs.current[task.id] = el;
                             }}
-                            onLayoutAnimationStart={() =>
-                              triggerSmoothEdgeTracking(480)
-                            }
+                            onLayoutAnimationStart={() => {
+                              requestAnimationFrame(recomputeEdges);
+                            }}
                             onLayoutAnimationComplete={recomputeEdges}
                             initial={{ opacity: 0, y: 14, scale: 0.96 }}
                             animate={{
@@ -1631,4 +1479,4 @@ export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
       )}
     </div>
   );
-};
+});

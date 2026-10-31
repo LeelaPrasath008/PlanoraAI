@@ -223,19 +223,13 @@ export async function saveFullEventToFirestore(
       updatedAt: serverTimestamp(),
     });
 
-    // Save subcollections
-    for (const b of event.budgetItems) {
-      await saveBudgetItemToFirestore(uid, cleanId, b);
-    }
-    for (const t of event.tasks) {
-      await saveTaskToFirestore(uid, cleanId, t);
-    }
-    for (const v of event.vendors) {
-      await saveVendorToFirestore(uid, cleanId, v);
-    }
-    for (const idea of event.ideas) {
-      await saveIdeaToFirestore(uid, cleanId, idea);
-    }
+    // Save subcollections concurrently via Promise.all for high efficiency
+    await Promise.all([
+      ...event.budgetItems.map((b) => saveBudgetItemToFirestore(uid, cleanId, b)),
+      ...event.tasks.map((t) => saveTaskToFirestore(uid, cleanId, t)),
+      ...event.vendors.map((v) => saveVendorToFirestore(uid, cleanId, v)),
+      ...event.ideas.map((idea) => saveIdeaToFirestore(uid, cleanId, idea)),
+    ]);
 
     return {
       ...event,
@@ -245,6 +239,57 @@ export async function saveFullEventToFirestore(
     };
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, eventPath);
+  }
+}
+
+export async function fetchSharedEventFromFirestore(
+  eventId: string,
+  shareToken: string
+): Promise<PlanoraEvent | null> {
+  const cleanId = eventId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
+  if (!cleanId) return null;
+  try {
+    const snap = await getDoc(doc(db, 'events', cleanId));
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    if (!data.isShared) return null;
+    if (shareToken && data.shareToken && data.shareToken !== shareToken) {
+      return null;
+    }
+    return {
+      id: cleanId,
+      ownerId: String(data.ownerId || ''),
+      isDemo: false,
+      title: String(data.title || 'Shared Event'),
+      description: String(data.description || ''),
+      eventType: data.eventType || 'Wedding',
+      eventDate: String(data.eventDate || '2027-03-15'),
+      durationHours: Number(data.durationHours) || 6,
+      city: String(data.city || 'Mumbai'),
+      guestCount: Number(data.guestCount) || 100,
+      totalBudget: Number(data.totalBudget) || 100000,
+      currency: data.currency || 'INR',
+      themeStyle: String(data.themeStyle || ''),
+      venuePreference: data.venuePreference || 'Hybrid',
+      foodPreference: String(data.foodPreference || ''),
+      culturalNotes: String(data.culturalNotes || ''),
+      mustHaves: String(data.mustHaves || ''),
+      avoidItems: String(data.avoidItems || ''),
+      priorities: String(data.priorities || 'Guest Experience'),
+      contingencyPercent: Number(data.contingencyPercent) || 8,
+      status: data.status || 'active',
+      isShared: true,
+      shareToken: String(data.shareToken || ''),
+      aiConceptSummary: String(data.aiConceptSummary || ''),
+      aiRisksAndContingencies: String(data.aiRisksAndContingencies || ''),
+      budgetItems: [],
+      tasks: [],
+      vendors: [],
+      ideas: [],
+      messages: [],
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -286,26 +331,28 @@ export async function updateEventMetadataInFirestore(
 }
 
 export async function deleteEventFromFirestore(
-  uid: string,
+  _uid: string,
   event: PlanoraEvent
 ): Promise<void> {
   const path = `events/${event.id}`;
   try {
-    for (const b of event.budgetItems) {
-      await deleteDoc(doc(db, 'events', event.id, 'budgetItems', b.id));
-    }
-    for (const t of event.tasks) {
-      await deleteDoc(doc(db, 'events', event.id, 'tasks', t.id));
-    }
-    for (const v of event.vendors) {
-      await deleteDoc(doc(db, 'events', event.id, 'vendors', v.id));
-    }
-    for (const i of event.ideas) {
-      await deleteDoc(doc(db, 'events', event.id, 'ideas', i.id));
-    }
-    for (const m of event.messages) {
-      await deleteDoc(doc(db, 'events', event.id, 'messages', m.id));
-    }
+    await Promise.all([
+      ...event.budgetItems.map((b) =>
+        deleteDoc(doc(db, 'events', event.id, 'budgetItems', b.id))
+      ),
+      ...event.tasks.map((t) =>
+        deleteDoc(doc(db, 'events', event.id, 'tasks', t.id))
+      ),
+      ...event.vendors.map((v) =>
+        deleteDoc(doc(db, 'events', event.id, 'vendors', v.id))
+      ),
+      ...event.ideas.map((i) =>
+        deleteDoc(doc(db, 'events', event.id, 'ideas', i.id))
+      ),
+      ...event.messages.map((m) =>
+        deleteDoc(doc(db, 'events', event.id, 'messages', m.id))
+      ),
+    ]);
     await deleteDoc(doc(db, 'events', event.id));
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, path);

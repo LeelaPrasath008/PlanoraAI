@@ -28,7 +28,7 @@ const COPILOT_QUICK_PROMPTS = [
   'Suggest a low-cost sustainable decor upgrade.',
 ];
 
-export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
+export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = React.memo(({
   event,
   onSendMessage,
   onConfirmProposedChange,
@@ -86,9 +86,11 @@ export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
       };
 
       onSendMessage(userMsg, assistantMsg);
-    } catch (err: any) {
+    } catch (err: unknown) {
       setError(
-        err?.message || 'Unable to reach Planora AI Copilot. Please try again.'
+        err instanceof Error
+          ? err.message
+          : 'Unable to reach Planora AI Copilot. Please try again.'
       );
     } finally {
       setIsLoading(false);
@@ -140,10 +142,12 @@ export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
           e.preventDefault();
           handleAsk(input);
         }}
+        aria-label="Ask Planora AI Copilot"
         className="flex items-center gap-2"
       >
         <input
           type="text"
+          aria-label="Copilot planning prompt"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           disabled={isLoading}
@@ -156,22 +160,29 @@ export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
           className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-[#1E1B4B] rounded-lg hover:bg-slate-900 disabled:opacity-50 whitespace-nowrap shrink-0"
         >
           {isLoading ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
           ) : (
-            <Send className="w-3.5 h-3.5" />
+            <Send className="w-3.5 h-3.5" aria-hidden="true" />
           )}
           <span>Ask Copilot</span>
         </button>
       </form>
 
       {error && (
-        <div className="p-2.5 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
+        <div
+          role="alert"
+          className="p-2.5 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg"
+        >
           {error}
         </div>
       )}
 
       {isLoading && (
-        <div className="p-3.5 border border-slate-200 rounded-lg space-y-2 animate-pulse">
+        <div
+          role="status"
+          aria-live="polite"
+          className="p-3.5 border border-slate-200 rounded-lg space-y-2 animate-pulse"
+        >
           <div className="h-3 bg-slate-200 rounded w-1/3" />
           <div className="h-3 bg-slate-100 rounded w-full" />
           <div className="h-3 bg-slate-100 rounded w-4/5" />
@@ -179,7 +190,10 @@ export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
       )}
 
       {/* Conversation History for Current Event */}
-      <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+      <div
+        aria-live="polite"
+        className="space-y-3 max-h-96 overflow-y-auto pr-1"
+      >
         {event.messages.length === 0 ? (
           <p className="text-xs text-slate-500 py-4 text-center">
             No conversation turns yet. Select a quick prompt above or ask a question.
@@ -268,4 +282,4 @@ export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
       </div>
     </section>
   );
-};
+});

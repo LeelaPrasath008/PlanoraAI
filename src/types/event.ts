@@ -98,6 +98,24 @@ export interface PlanoraIdea {
   executionTip: string;
 }
 
+export interface CopilotChangePayload {
+  newTotalBudget?: number;
+  newGuestCount?: number;
+  scaleFactor?: number;
+  excludeCategory?: string;
+  category?: string;
+  title?: string;
+  plannedAmount?: number;
+  notes?: string;
+  description?: string;
+  dueDate?: string;
+  priority?: 'High' | 'Medium' | 'Low';
+  vendorName?: string;
+  estimatedPrice?: number;
+  estimatedCostImpact?: string;
+  executionTip?: string;
+}
+
 export interface ProposedCopilotChange {
   type:
     | 'update_budget_total'
@@ -108,7 +126,7 @@ export interface ProposedCopilotChange {
     | 'add_vendor'
     | 'add_idea';
   summaryLabel: string;
-  payload: Record<string, any>;
+  payload: CopilotChangePayload;
 }
 
 export interface CopilotChatMessage {

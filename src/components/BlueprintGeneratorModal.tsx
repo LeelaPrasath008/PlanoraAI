@@ -113,6 +113,47 @@ const WIZARD_PRESETS: Array<{
   },
 ];
 
+interface GeneratedBudgetItemRaw {
+  category?: string;
+  title?: string;
+  plannedAmount?: number;
+  quotedAmount?: number;
+  actualAmount?: number;
+  lowEstimate?: number;
+  highEstimate?: number;
+  paymentStatus?: 'Paid' | 'Pending' | 'Unpaid';
+  notes?: string;
+}
+
+interface GeneratedTaskRaw {
+  title?: string;
+  description?: string;
+  dueDate?: string;
+  durationDays?: number;
+  priority?: 'High' | 'Medium' | 'Low';
+  category?: string;
+  status?: 'Todo' | 'In Progress' | 'Completed';
+  assignee?: string;
+}
+
+interface GeneratedVendorRaw {
+  category?: string;
+  vendorName?: string;
+  contactInfo?: string;
+  estimatedPrice?: number;
+  quotedAmount?: number;
+  followUpDate?: string;
+  notes?: string;
+}
+
+interface GeneratedIdeaRaw {
+  category?: 'Decor' | 'Food & Beverage' | 'Entertainment' | 'Invitations' | 'Activities';
+  title?: string;
+  description?: string;
+  estimatedCostImpact?: string;
+  executionTip?: string;
+}
+
 export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = ({
   isOpen,
   ownerId,
@@ -156,6 +197,17 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isGenerating) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, isGenerating, onClose]);
 
   if (!isOpen) return null;
 
@@ -256,6 +308,11 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
 
       const now = Date.now();
       const eventId = `evt_${now}`;
+      const rawBudgetItems = (data.budgetItems || []) as GeneratedBudgetItemRaw[];
+      const rawTasks = (data.tasks || []) as GeneratedTaskRaw[];
+      const rawVendors = (data.vendors || []) as GeneratedVendorRaw[];
+      const rawIdeas = (data.ideas || []) as GeneratedIdeaRaw[];
+
       const newPlan: PlanoraEvent = {
         id: eventId,
         ownerId,
@@ -286,7 +343,7 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
         aiRisksAndContingencies:
           data.aiRisksAndContingencies ||
           'Review weather backup and vendor cancellation clauses.',
-        budgetItems: (data.budgetItems || []).map((b: any, i: number) => ({
+        budgetItems: rawBudgetItems.map((b, i) => ({
           id: `b_${now}_${i}`,
           eventId,
           ownerId,
@@ -297,29 +354,33 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
           actualAmount: Number(b.actualAmount) || 0,
           lowEstimate: Number(b.lowEstimate) || 0,
           highEstimate: Number(b.highEstimate) || 0,
-          paymentStatus: ['Paid', 'Pending', 'Unpaid'].includes(b.paymentStatus)
-            ? b.paymentStatus
-            : 'Unpaid',
+          paymentStatus:
+            b.paymentStatus && ['Paid', 'Pending', 'Unpaid'].includes(b.paymentStatus)
+              ? b.paymentStatus
+              : 'Unpaid',
           notes: b.notes || '',
         })),
-        tasks: (data.tasks || []).map((t: any, i: number) => ({
+        tasks: rawTasks.map((t, i) => ({
           id: `t_${now}_${i}`,
           eventId,
           ownerId,
           title: t.title || 'Preparation Task',
           description: t.description || '',
           dueDate: t.dueDate || eventDate,
-          priority: ['High', 'Medium', 'Low'].includes(t.priority)
-            ? t.priority
-            : 'Medium',
+          durationDays: Number(t.durationDays) || 7,
+          priority:
+            t.priority && ['High', 'Medium', 'Low'].includes(t.priority)
+              ? t.priority
+              : 'Medium',
           category: t.category || 'General',
-          status: ['Todo', 'In Progress', 'Completed'].includes(t.status)
-            ? t.status
-            : 'Todo',
+          status:
+            t.status && ['Todo', 'In Progress', 'Completed'].includes(t.status)
+              ? t.status
+              : 'Todo',
           dependsOnTaskId: i > 0 ? `t_${now}_${i - 1}` : '',
           assignee: t.assignee || 'Organizer',
         })),
-        vendors: (data.vendors || []).map((v: any, i: number) => ({
+        vendors: rawVendors.map((v, i) => ({
           id: `v_${now}_${i}`,
           eventId,
           ownerId,
@@ -334,19 +395,21 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
           notes: v.notes || '',
           isAiSuggestion: true,
         })),
-        ideas: (data.ideas || []).map((idea: any, i: number) => ({
+        ideas: rawIdeas.map((idea, i) => ({
           id: `i_${now}_${i}`,
           eventId,
           ownerId,
-          category: [
-            'Decor',
-            'Food & Beverage',
-            'Entertainment',
-            'Invitations',
-            'Activities',
-          ].includes(idea.category)
-            ? idea.category
-            : 'Decor',
+          category:
+            idea.category &&
+            [
+              'Decor',
+              'Food & Beverage',
+              'Entertainment',
+              'Invitations',
+              'Activities',
+            ].includes(idea.category)
+              ? idea.category
+              : 'Decor',
           title: idea.title || 'Creative Recommendation',
           description: idea.description || '',
           estimatedCostImpact: idea.estimatedCostImpact || 'Within budget',
@@ -371,9 +434,11 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
       onCreated(newPlan);
       onClose();
       setStep(1);
-    } catch (err: any) {
+    } catch (err: unknown) {
       setValidationError(
-        err?.message || 'Unable to generate event plan. Please try again.'
+        err instanceof Error
+          ? err.message
+          : 'Unable to generate event plan. Please try again.'
       );
     } finally {
       setIsGenerating(false);
@@ -408,7 +473,7 @@ export const BlueprintGeneratorModal: React.FC<BlueprintGeneratorModalProps> = (
             className="p-2 text-slate-500 hover:text-slate-900 rounded-lg"
             aria-label="Close wizard"
           >
-            <X className="w-4 h-4" />
+            <X className="w-4 h-4" aria-hidden="true" />
           </button>
         </div>
 

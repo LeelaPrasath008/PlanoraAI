@@ -1,45 +1,219 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, GenerateContentConfig } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const isGeminiConfigured = Boolean(
-  process.env.GEMINI_API_KEY &&
-    process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' &&
-    process.env.GEMINI_API_KEY.trim().length > 5
-);
+export interface GeneratePlanPayload {
+  eventType?: string;
+  title?: string;
+  description?: string;
+  eventDate?: string;
+  durationHours?: number;
+  city?: string;
+  guestCount?: number;
+  totalBudget?: number;
+  currency?: string;
+  contingencyPercent?: number;
+  venuePreference?: string;
+  themeStyle?: string;
+  foodPreference?: string;
+  culturalNotes?: string;
+  mustHaves?: string;
+  avoidItems?: string;
+  priorities?: string;
+}
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || 'unconfigured',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+export interface ServerBudgetItemInput {
+  id?: string;
+  category?: string;
+  title?: string;
+  plannedAmount?: number;
+  actualAmount?: number;
+}
+
+export interface ServerVendorInput {
+  category?: string;
+  vendorName?: string;
+  estimatedPrice?: number;
+  quotedAmount?: number;
+}
+
+export interface ServerEventInput {
+  title?: string;
+  eventType?: string;
+  eventDate?: string;
+  city?: string;
+  venuePreference?: string;
+  guestCount?: number;
+  totalBudget?: number;
+  currency?: string;
+  contingencyPercent?: number;
+  priorities?: string;
+  mustHaves?: string;
+  foodPreference?: string;
+  budgetItems?: ServerBudgetItemInput[];
+  tasks?: unknown[];
+  vendors?: ServerVendorInput[];
+}
+
+export function sanitizeText(
+  value: unknown,
+  maxLength: number,
+  fallback = ''
+): string {
+  if (typeof value !== 'string') return fallback;
+  const cleaned = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim();
+  return (cleaned || fallback).slice(0, maxLength);
+}
+
+export function clampNumber(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number
+): number {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, num));
+}
+
+function getResolvedApiKey(): string | undefined {
+  const candidates = [process.env.API_KEY, process.env.GEMINI_API_KEY];
+  for (const key of candidates) {
+    if (key && key !== 'MY_GEMINI_API_KEY' && key.trim().length > 5) {
+      return key.trim();
+    }
+  }
+  return undefined;
+}
+
+export function checkGeminiConfigured(): boolean {
+  return Boolean(getResolvedApiKey());
+}
+
+function getAiClient(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: getResolvedApiKey() || 'unconfigured',
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
 
-const MODEL_NAME = 'gemini-3.8-flash';
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 
-function buildDeterministicFallbackPlan(payload: any) {
-  const totalBudget = Number(payload.totalBudget) || 100000;
-  const guestCount = Number(payload.guestCount) || 100;
-  const contingencyPct = Number(payload.contingencyPercent) || 8;
+// In-memory LRU response cache for high efficiency on repeated queries
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 64;
+const aiResponseCache = new Map<string, { expiresAt: number; data: Record<string, unknown> }>();
+
+function getCachedResponse(key: string): Record<string, unknown> | null {
+  const entry = aiResponseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    aiResponseCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedResponse(key: string, data: Record<string, unknown>): void {
+  if (aiResponseCache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = aiResponseCache.keys().next().value;
+    if (oldestKey) aiResponseCache.delete(oldestKey);
+  }
+  aiResponseCache.set(key, {
+    expiresAt: Date.now() + CACHE_TTL_MS,
+    data,
+  });
+}
+
+// Sliding-window rate limiter per client IP
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX_REQUESTS = 60;
+const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
+
+function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket.remoteAddress || 'local';
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(ip);
+
+  if (!bucket || now > bucket.resetAt) {
+    rateLimitBuckets.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    next();
+    return;
+  }
+
+  if (bucket.count >= RATE_MAX_REQUESTS) {
+    res.status(429).json({
+      error: 'Too many requests. Please wait a moment before retrying.',
+    });
+    return;
+  }
+
+  bucket.count += 1;
+  next();
+}
+
+function securityHeadersMiddleware(_req: Request, res: Response, next: NextFunction): void {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  next();
+}
+
+async function generateWithGemini(params: {
+  contents: string;
+  config: GenerateContentConfig;
+}) {
+  const ai = getAiClient();
+  try {
+    return await ai.models.generateContent({
+      model: PRIMARY_MODEL,
+      contents: params.contents,
+      config: params.config,
+    });
+  } catch {
+    return await ai.models.generateContent({
+      model: FALLBACK_MODEL,
+      contents: params.contents,
+      config: params.config,
+    });
+  }
+}
+
+export function buildDeterministicFallbackPlan(payload: GeneratePlanPayload) {
+  const totalBudget = clampNumber(payload.totalBudget, 500, 1_000_000_000, 100000);
+  const guestCount = clampNumber(payload.guestCount, 1, 100000, 100);
+  const contingencyPct = clampNumber(payload.contingencyPercent, 0, 50, 8);
   const usableBudget = Math.round(totalBudget * (1 - contingencyPct / 100));
-  const eventDate = payload.eventDate || '2027-03-15';
+  const eventDate = sanitizeText(payload.eventDate, 32, '2027-03-15');
+  const eventType = sanitizeText(payload.eventType, 60, 'Event');
+  const city = sanitizeText(payload.city, 120, 'your city');
+  const themeStyle = sanitizeText(payload.themeStyle, 240, 'Warm Contemporary Elegance');
+  const venuePreference = sanitizeText(payload.venuePreference, 32, 'Hybrid');
+  const foodPreference = sanitizeText(payload.foodPreference, 240, 'Curated Multi-Course Menu');
+  const priorities = sanitizeText(payload.priorities, 240, 'Guest Experience and Affordability');
+  const mustHaves = sanitizeText(payload.mustHaves, 240, 'core elements');
+  const avoidItems = sanitizeText(payload.avoidItems, 240, 'unwanted items');
 
   return {
     isDeterministicFallback: true,
-    aiConceptSummary: `[Deterministic Demo Fallback — Configure GEMINI_API_KEY for Live AI] A structured ${payload.eventType || 'Event'} blueprint for ${guestCount} guests in ${payload.city || 'your city'} designed around "${payload.themeStyle || 'Warm Contemporary Elegance'}". Preserves ${contingencyPct}% contingency reserve while prioritizing ${payload.priorities || 'Guest Experience and Affordability'}.`,
-    aiRisksAndContingencies: `1. Weather & Venue Backup (${payload.venuePreference || 'Hybrid'}): Confirm covered backup area 14 days prior. 2. Overlooked Costs: Account for generator backup, service taxes, and local sound permits within the ${contingencyPct}% contingency reserve.`,
+    aiConceptSummary: `[Deterministic Demo Fallback — Configure GEMINI_API_KEY for Live AI] A structured ${eventType} blueprint for ${guestCount} guests in ${city} designed around "${themeStyle}". Preserves ${contingencyPct}% contingency reserve while prioritizing ${priorities}.`,
+    aiRisksAndContingencies: `1. Weather & Venue Backup (${venuePreference}): Confirm covered backup area 14 days prior. 2. Overlooked Costs: Account for generator backup, service taxes, and local sound permits within the ${contingencyPct}% contingency reserve.`,
     budgetItems: [
       {
         category: 'Venue',
-        title: `${payload.venuePreference || 'Hybrid'} Venue Booking & Basic Seating`,
+        title: `${venuePreference} Venue Booking & Basic Seating`,
         plannedAmount: Math.round(usableBudget * 0.26),
         quotedAmount: Math.round(usableBudget * 0.25),
         actualAmount: 0,
@@ -50,7 +224,7 @@ function buildDeterministicFallbackPlan(payload: any) {
       },
       {
         category: 'Catering',
-        title: `${payload.foodPreference || 'Curated Multi-Course Menu'} (${guestCount} Guests)`,
+        title: `${foodPreference} (${guestCount} Guests)`,
         plannedAmount: Math.round(usableBudget * 0.38),
         quotedAmount: Math.round(usableBudget * 0.38),
         actualAmount: 0,
@@ -61,7 +235,7 @@ function buildDeterministicFallbackPlan(payload: any) {
       },
       {
         category: 'Decoration',
-        title: `Theme Decor: ${payload.themeStyle || 'Seasonal Florals & Ambient Lighting'}`,
+        title: `Theme Decor: ${themeStyle}`,
         plannedAmount: Math.round(usableBudget * 0.14),
         quotedAmount: Math.round(usableBudget * 0.14),
         actualAmount: 0,
@@ -109,6 +283,7 @@ function buildDeterministicFallbackPlan(payload: any) {
         title: 'Shortlist & Lock Primary Venue Contract',
         description: 'Verify capacity, load-in hours, power backup, and cancellation terms.',
         dueDate: eventDate,
+        durationDays: 10,
         priority: 'High',
         category: 'Venue',
         status: 'Todo',
@@ -116,8 +291,9 @@ function buildDeterministicFallbackPlan(payload: any) {
       },
       {
         title: 'Finalize Catering Menu & Dietary Matrix',
-        description: `Confirm menu aligned with: ${payload.foodPreference || 'guest preferences'}.`,
+        description: `Confirm menu aligned with: ${foodPreference}.`,
         dueDate: eventDate,
+        durationDays: 7,
         priority: 'High',
         category: 'Catering',
         status: 'Todo',
@@ -125,8 +301,9 @@ function buildDeterministicFallbackPlan(payload: any) {
       },
       {
         title: 'Approve Decor Layout & Lighting Plan',
-        description: `Incorporate must-haves (${payload.mustHaves || 'core elements'}) and avoid ${payload.avoidItems || 'unwanted items'}.`,
+        description: `Incorporate must-haves (${mustHaves}) and avoid ${avoidItems}.`,
         dueDate: eventDate,
+        durationDays: 6,
         priority: 'Medium',
         category: 'Decoration',
         status: 'Todo',
@@ -136,7 +313,7 @@ function buildDeterministicFallbackPlan(payload: any) {
     vendors: [
       {
         category: 'Venue',
-        vendorName: `Suggested Archetype: ${payload.venuePreference || 'Hybrid'} Venue in ${payload.city || 'City'}`,
+        vendorName: `Suggested Archetype: ${venuePreference} Venue in ${city}`,
         contactInfo: 'Unverified Suggestion — Compare 3 local venue quotes',
         estimatedPrice: Math.round(usableBudget * 0.26),
         quotedAmount: 0,
@@ -180,50 +357,81 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '2mb' }));
+  app.disable('x-powered-by');
+  app.use(securityHeadersMiddleware);
+  app.use(express.json({ limit: '1mb' }));
+  app.use('/api/ai', rateLimitMiddleware);
 
-  app.get('/api/ai/status', (_req, res) => {
-    res.json({ configured: isGeminiConfigured });
+  app.get('/api/ai/status', (_req: Request, res: Response) => {
+    const configured = checkGeminiConfigured();
+    res.json({
+      configured,
+      primaryModel: PRIMARY_MODEL,
+      fallbackModel: FALLBACK_MODEL,
+      mode: configured ? 'live_gemini' : 'deterministic_fallback',
+    });
   });
 
   // 1. Full AI Event Plan Engine (Wizard Step 5)
-  app.post('/api/ai/generate-plan', async (req, res) => {
-    const payload = req.body || {};
+  app.post('/api/ai/generate-plan', async (req: Request, res: Response) => {
+    const payload = (req.body || {}) as GeneratePlanPayload;
 
-    if (!isGeminiConfigured) {
-      return res.json(buildDeterministicFallbackPlan(payload));
+    if (!checkGeminiConfigured()) {
+      res.json(buildDeterministicFallbackPlan(payload));
+      return;
+    }
+
+    const cacheKey = `plan:${JSON.stringify(payload)}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
     }
 
     try {
       const todayStr = new Date().toISOString().slice(0, 10);
-      const totalBudget = Number(payload.totalBudget) || 100000;
-      const contingencyPct = Number(payload.contingencyPercent) || 8;
+      const totalBudget = clampNumber(payload.totalBudget, 500, 1_000_000_000, 100000);
+      const guestCount = clampNumber(payload.guestCount, 1, 100000, 100);
+      const contingencyPct = clampNumber(payload.contingencyPercent, 0, 50, 8);
       const usableBudget = Math.round(totalBudget * (1 - contingencyPct / 100));
+      const eventType = sanitizeText(payload.eventType, 60, 'Wedding');
+      const title = sanitizeText(payload.title, 160, 'Untitled Event');
+      const description = sanitizeText(payload.description, 800, 'N/A');
+      const eventDate = sanitizeText(payload.eventDate, 32, '2027-03-15');
+      const durationHours = clampNumber(payload.durationHours, 1, 240, 6);
+      const city = sanitizeText(payload.city, 120, 'Mumbai');
+      const currency = sanitizeText(payload.currency, 8, 'INR');
+      const themeStyle = sanitizeText(payload.themeStyle, 240, 'Classic');
+      const venuePreference = sanitizeText(payload.venuePreference, 32, 'Hybrid');
+      const foodPreference = sanitizeText(payload.foodPreference, 240, 'Regional Menu');
+      const culturalNotes = sanitizeText(payload.culturalNotes, 400, 'None specified');
+      const mustHaves = sanitizeText(payload.mustHaves, 400, 'None');
+      const avoidItems = sanitizeText(payload.avoidItems, 400, 'None');
+      const priorities = sanitizeText(payload.priorities, 240, 'Guest Experience');
 
       const prompt = `Generate a complete, realistic, culturally and regionally grounded event plan for Planora AI:
-- Event Type: ${payload.eventType}
-- Title: ${payload.title}
-- Description: ${payload.description || 'N/A'}
-- Event Date: ${payload.eventDate} (Current Date: ${todayStr} — if the event date is within 14 days, prioritize urgent immediate tasks!)
-- Duration: ${payload.durationHours || 6} hours
-- City / Location: ${payload.city}
-- Guest Count: ${payload.guestCount}
-- Total Budget: ${payload.currency} ${totalBudget} (Contingency Reserve: ${contingencyPct}%, so allocate approximately ${payload.currency} ${usableBudget} across categories)
-- Preferred Theme & Style: ${payload.themeStyle}
-- Venue Preference: ${payload.venuePreference}
-- Food & Dietary Preferences: ${payload.foodPreference}
-- Cultural / Regional Preferences: ${payload.culturalNotes || 'None specified'}
-- Must-Have Elements: ${payload.mustHaves || 'None'}
-- Items to Avoid: ${payload.avoidItems || 'None'}
-- Stated Priorities: ${payload.priorities}
+- Event Type: ${eventType}
+- Title: ${title}
+- Description: ${description}
+- Event Date: ${eventDate} (Current Date: ${todayStr} — if the event date is within 14 days, prioritize urgent immediate tasks!)
+- Duration: ${durationHours} hours
+- City / Location: ${city}
+- Guest Count: ${guestCount}
+- Total Budget: ${currency} ${totalBudget} (Contingency Reserve: ${contingencyPct}%, so allocate approximately ${currency} ${usableBudget} across categories)
+- Preferred Theme & Style: ${themeStyle}
+- Venue Preference: ${venuePreference}
+- Food & Dietary Preferences: ${foodPreference}
+- Cultural / Regional Preferences: ${culturalNotes}
+- Must-Have Elements: ${mustHaves}
+- Items to Avoid: ${avoidItems}
+- Stated Priorities: ${priorities}
 
 CRITICAL RULES:
 1. Never invent fake real-world business phone numbers or claim a specific real-world vendor is confirmed. Prefix AI-suggested vendor entries with "Suggested Archetype:" and provide concrete selection criteria and questions to ask in "notes".
 2. Ensure the sum of "plannedAmount" across all budgetItems is close to ${usableBudget} (${totalBudget} minus ${contingencyPct}% contingency). Set "actualAmount" to 0 and "paymentStatus" to "Unpaid" for a fresh plan.
-3. Provide 6-7 budgetItems, 6-7 tasks with realistic YYYY-MM-DD dueDates between ${todayStr} and ${payload.eventDate}, 5-6 vendor archetypes, and 5 creative ideas across Decor, Food & Beverage, Entertainment, Invitations, and Activities.`;
+3. Provide 6-7 budgetItems, 6-7 tasks with realistic YYYY-MM-DD dueDates between ${todayStr} and ${eventDate} and durationDays (between 3 and 18), 5-6 vendor archetypes, and 5 creative ideas across Decor, Food & Beverage, Entertainment, Invitations, and Activities.`;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+      const response = await generateWithGemini({
         contents: prompt,
         config: {
           systemInstruction:
@@ -276,6 +484,7 @@ CRITICAL RULES:
                     title: { type: Type.STRING },
                     description: { type: Type.STRING },
                     dueDate: { type: Type.STRING },
+                    durationDays: { type: Type.NUMBER },
                     priority: { type: Type.STRING },
                     category: { type: Type.STRING },
                     status: { type: Type.STRING },
@@ -285,6 +494,7 @@ CRITICAL RULES:
                     'title',
                     'description',
                     'dueDate',
+                    'durationDays',
                     'priority',
                     'category',
                     'status',
@@ -351,59 +561,74 @@ CRITICAL RULES:
         },
       });
 
-      const parsed = JSON.parse(response.text || '{}');
-      res.json({
+      const parsed = JSON.parse(response.text || '{}') as Record<string, unknown>;
+      const result = {
         ...parsed,
         isDeterministicFallback: false,
-      });
-    } catch (error: any) {
-      console.error('Error in /api/ai/generate-plan:', error);
-      // Graceful fallback clearly labeled as demo fallback
+      };
+      setCachedResponse(cacheKey, result);
+      res.json(result);
+    } catch (error: unknown) {
+      const errMessage =
+        error instanceof Error
+          ? error.message
+          : 'Gemini API temporarily unavailable; using labeled deterministic plan.';
       res.json({
         ...buildDeterministicFallbackPlan(payload),
-        fallbackReason:
-          error?.message || 'Gemini API temporarily unavailable; using labeled deterministic plan.',
+        fallbackReason: errMessage,
       });
     }
   });
 
   // 2. Optimize My Budget AI Action
-  app.post('/api/ai/optimize-budget', async (req, res) => {
-    const { event, targetReductionPercent = 12 } = req.body || {};
+  app.post('/api/ai/optimize-budget', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      event?: ServerEventInput;
+      targetReductionPercent?: number;
+    };
+    const event = body.event;
+    const targetReductionPercent = clampNumber(body.targetReductionPercent, 1, 50, 12);
 
-    if (!isGeminiConfigured) {
-      const items = (event?.budgetItems || []).map((item: any) => {
+    const buildFallbackAdjustments = () => {
+      const items = (event?.budgetItems || []).map((item: ServerBudgetItemInput) => {
+        const cat = String(item.category || 'General');
         const isProtected =
-          item.category.toLowerCase().includes('catering') ||
-          item.category.toLowerCase().includes('food');
+          cat.toLowerCase().includes('catering') ||
+          cat.toLowerCase().includes('food');
         const factor = isProtected ? 0.96 : 1 - targetReductionPercent / 100;
+        const planned = Number(item.plannedAmount) || 0;
         return {
-          id: item.id,
-          category: item.category,
-          title: item.title,
-          currentPlanned: item.plannedAmount,
-          recommendedPlanned: Math.round(item.plannedAmount * factor),
+          id: String(item.id || ''),
+          category: cat,
+          title: String(item.title || 'Expense'),
+          currentPlanned: planned,
+          recommendedPlanned: Math.round(planned * factor),
           rationale: isProtected
             ? 'Protected core hospitality priority (minimal 4% trim via seasonal menu swap).'
             : `Reduced by ${targetReductionPercent}% using off-peak package & local sourcing.`,
         };
       });
-      return res.json({
+      return {
         isDeterministicFallback: true,
         strategySummary:
           '[Deterministic Optimization Preview] Preserves guest culinary experience while trimming non-essential decor and rental overhead.',
         adjustments: items,
-      });
+      };
+    };
+
+    if (!checkGeminiConfigured()) {
+      res.json(buildFallbackAdjustments());
+      return;
     }
 
     try {
       const prompt = `Optimize the budget for this event while strictly respecting the user's stated priorities:
-- Event: ${event?.title} (${event?.eventType}, ${event?.guestCount} guests, ${event?.city})
-- Total Budget Cap: ${event?.currency} ${event?.totalBudget} (Contingency: ${event?.contingencyPercent}%)
-- User Priorities: ${event?.priorities}
-- Must-Haves: ${event?.mustHaves}
+- Event: ${sanitizeText(event?.title, 160, 'Event')} (${sanitizeText(event?.eventType, 60, 'Wedding')}, ${clampNumber(event?.guestCount, 1, 100000, 100)} guests, ${sanitizeText(event?.city, 120, 'City')})
+- Total Budget Cap: ${sanitizeText(event?.currency, 8, 'INR')} ${clampNumber(event?.totalBudget, 0, 1_000_000_000, 100000)} (Contingency: ${clampNumber(event?.contingencyPercent, 0, 50, 8)}%)
+- User Priorities: ${sanitizeText(event?.priorities, 240, 'Guest Experience')}
+- Must-Haves: ${sanitizeText(event?.mustHaves, 300, 'None')}
 - Current Budget Items: ${JSON.stringify(
-        (event?.budgetItems || []).map((b: any) => ({
+        (event?.budgetItems || []).map((b: ServerBudgetItemInput) => ({
           id: b.id,
           category: b.category,
           title: b.title,
@@ -413,8 +638,7 @@ CRITICAL RULES:
 
 Propose a realistic optimization that brings total planned spending comfortably within the usable budget (or saves ~${targetReductionPercent}%) while protecting the user's top priorities. Return the exact item "id" for each adjustment.`;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+      const response = await generateWithGemini({
         contents: prompt,
         config: {
           systemInstruction:
@@ -453,49 +677,54 @@ Propose a realistic optimization that brings total planned spending comfortably 
       });
 
       res.json({
-        ...JSON.parse(response.text || '{}'),
+        ...(JSON.parse(response.text || '{}') as Record<string, unknown>),
         isDeterministicFallback: false,
       });
-    } catch (error: any) {
-      console.error('Error in /api/ai/optimize-budget:', error);
-      res.status(500).json({
-        error: error?.message || 'Failed to optimize budget with AI.',
-      });
+    } catch {
+      res.json(buildFallbackAdjustments());
     }
   });
 
   // 3. AI Planning Copilot (with explicit user confirmation for state changes)
-  app.post('/api/ai/copilot', async (req, res) => {
-    const { event, userMessage } = req.body || {};
+  app.post('/api/ai/copilot', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      event?: ServerEventInput;
+      userMessage?: string;
+    };
+    const event = body.event;
+    const userMessage = sanitizeText(body.userMessage, 1000, 'Analyze my event plan.');
 
-    if (!isGeminiConfigured) {
-      return res.json({
-        isDeterministicFallback: true,
-        reply: `[Demo Copilot Mode] Based on "${event?.title}" (${event?.guestCount} guests, budget ${event?.currency} ${event?.totalBudget}), I recommend reviewing your top 3 cost centers and locking high-priority tasks due in the next 14 days. You can preview and confirm the proposed adjustment below.`,
-        proposedChanges: [
-          {
-            type: 'add_task',
-            summaryLabel: 'Add Task: Confirm Final Vendor Payment & Delivery Schedule',
-            payload: {
-              title: 'Confirm Final Vendor Payment & Delivery Schedule',
-              description: 'Verify arrival times and balance invoices for all booked vendors.',
-              dueDate: event?.eventDate || '2027-02-01',
-              priority: 'High',
-              category: 'Operations',
-            },
+    const buildFallbackCopilot = () => ({
+      isDeterministicFallback: true,
+      reply: `[Demo Copilot Mode] Based on "${sanitizeText(event?.title, 120, 'your event')}" (${clampNumber(event?.guestCount, 1, 100000, 100)} guests, budget ${sanitizeText(event?.currency, 8, 'INR')} ${clampNumber(event?.totalBudget, 0, 1_000_000_000, 100000)}), I recommend reviewing your top 3 cost centers and locking high-priority tasks due in the next 14 days. You can preview and confirm the proposed adjustment below.`,
+      proposedChanges: [
+        {
+          type: 'add_task',
+          summaryLabel: 'Add Task: Confirm Final Vendor Payment & Delivery Schedule',
+          payload: {
+            title: 'Confirm Final Vendor Payment & Delivery Schedule',
+            description: 'Verify arrival times and balance invoices for all booked vendors.',
+            dueDate: sanitizeText(event?.eventDate, 32, '2027-02-01'),
+            priority: 'High',
+            category: 'Operations',
           },
-        ],
-      });
+        },
+      ],
+    });
+
+    if (!checkGeminiConfigured()) {
+      res.json(buildFallbackCopilot());
+      return;
     }
 
     try {
       const prompt = `Current Saved Event Context:
-- Event: ${event?.title} (${event?.eventType})
-- Date: ${event?.eventDate} | City: ${event?.city} | Venue: ${event?.venuePreference}
-- Guests: ${event?.guestCount} | Total Budget: ${event?.currency} ${event?.totalBudget} (Contingency: ${event?.contingencyPercent}%)
-- Priorities: ${event?.priorities} | Food: ${event?.foodPreference}
+- Event: ${sanitizeText(event?.title, 160, 'Event')} (${sanitizeText(event?.eventType, 60, 'Wedding')})
+- Date: ${sanitizeText(event?.eventDate, 32, '2027-03-15')} | City: ${sanitizeText(event?.city, 120, 'City')} | Venue: ${sanitizeText(event?.venuePreference, 32, 'Hybrid')}
+- Guests: ${clampNumber(event?.guestCount, 1, 100000, 100)} | Total Budget: ${sanitizeText(event?.currency, 8, 'INR')} ${clampNumber(event?.totalBudget, 0, 1_000_000_000, 100000)} (Contingency: ${clampNumber(event?.contingencyPercent, 0, 50, 8)}%)
+- Priorities: ${sanitizeText(event?.priorities, 240, 'Guest Experience')} | Food: ${sanitizeText(event?.foodPreference, 240, 'Regional')}
 - Current Budget Items: ${JSON.stringify(
-        (event?.budgetItems || []).map((b: any) => ({
+        (event?.budgetItems || []).map((b: ServerBudgetItemInput) => ({
           category: b.category,
           title: b.title,
           plannedAmount: b.plannedAmount,
@@ -504,7 +733,7 @@ Propose a realistic optimization that brings total planned spending comfortably 
       )}
 - Current Tasks Count: ${(event?.tasks || []).length}
 - Current Vendors: ${JSON.stringify(
-        (event?.vendors || []).map((v: any) => ({
+        (event?.vendors || []).map((v: ServerVendorInput) => ({
           category: v.category,
           vendorName: v.vendorName,
           estimatedPrice: v.estimatedPrice,
@@ -527,8 +756,7 @@ Instructions:
    - "add_vendor" (payload: { category: string, vendorName: string, estimatedPrice: number, notes: string })
    - "add_idea" (payload: { category: "Decor" | "Food & Beverage" | "Entertainment" | "Invitations" | "Activities", title: string, description: string, estimatedCostImpact: string, executionTip: string })`;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+      const response = await generateWithGemini({
         contents: prompt,
         config: {
           systemInstruction:
@@ -577,50 +805,61 @@ Instructions:
       });
 
       res.json({
-        ...JSON.parse(response.text || '{}'),
+        ...(JSON.parse(response.text || '{}') as Record<string, unknown>),
         isDeterministicFallback: false,
       });
-    } catch (error: any) {
-      console.error('Error in /api/ai/copilot:', error);
-      res.status(500).json({
-        error: error?.message || 'Failed to consult Planora AI Copilot.',
-      });
+    } catch {
+      res.json(buildFallbackCopilot());
     }
   });
 
   // 4. Scenario Simulator ("What If?" AI Trade-Off Explanation)
-  app.post('/api/ai/simulate-scenario', async (req, res) => {
-    const { currentPlan, simulatedScenario } = req.body || {};
+  app.post('/api/ai/simulate-scenario', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      currentPlan?: Record<string, unknown>;
+      simulatedScenario?: Record<string, unknown>;
+    };
+    const currentPlan = body.currentPlan || {};
+    const simulatedScenario = body.simulatedScenario || {};
 
-    if (!isGeminiConfigured) {
-      return res.json({
-        isDeterministicFallback: true,
-        tradeOffAnalysis: `[Deterministic Trade-Off Summary] Shifting from ${currentPlan?.guestCount} to ${simulatedScenario?.guestCount} guests with a ${simulatedScenario?.cateringTier} catering tier and ${simulatedScenario?.venuePreference} venue changes variable hospitality costs while fixed production costs (photography, entertainment) remain stable.`,
-        recommendations: [
-          'Lock catering per-plate slabs for the new guest count tier before paying the venue deposit.',
-          'Adjust contingency reserve if switching from Indoor to Outdoor to cover weather backup.',
-        ],
-      });
+    const buildFallbackScenario = () => ({
+      isDeterministicFallback: true,
+      tradeOffAnalysis: `[Deterministic Trade-Off Summary] Shifting from ${clampNumber(currentPlan.guestCount, 1, 100000, 100)} to ${clampNumber(simulatedScenario.guestCount, 1, 100000, 100)} guests with a ${sanitizeText(simulatedScenario.cateringTier, 60, 'Signature')} catering tier and ${sanitizeText(simulatedScenario.venuePreference, 32, 'Hybrid')} venue changes variable hospitality costs while fixed production costs (photography, entertainment) remain stable.`,
+      recommendations: [
+        'Lock catering per-plate slabs for the new guest count tier before paying the venue deposit.',
+        'Adjust contingency reserve if switching from Indoor to Outdoor to cover weather backup.',
+      ],
+    });
+
+    if (!checkGeminiConfigured()) {
+      res.json(buildFallbackScenario());
+      return;
+    }
+
+    const cacheKey = `sim:${JSON.stringify({ currentPlan, simulatedScenario })}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
     }
 
     try {
       const prompt = `Compare the Current Plan vs. the Proposed "What If?" Scenario and explain the practical trade-offs:
 Current Plan:
-- Guests: ${currentPlan?.guestCount} | Total Budget: ${currentPlan?.currency} ${currentPlan?.totalBudget}
-- Date: ${currentPlan?.eventDate} | Venue Type: ${currentPlan?.venuePreference}
-- Priorities: ${currentPlan?.priorities}
+- Guests: ${clampNumber(currentPlan.guestCount, 1, 100000, 100)} | Total Budget: ${sanitizeText(currentPlan.currency, 8, 'INR')} ${clampNumber(currentPlan.totalBudget, 0, 1_000_000_000, 100000)}
+- Date: ${sanitizeText(currentPlan.eventDate, 32, '2027-03-15')} | Venue Type: ${sanitizeText(currentPlan.venuePreference, 32, 'Hybrid')}
+- Priorities: ${sanitizeText(currentPlan.priorities, 240, 'Guest Experience')}
 
 Proposed Scenario:
-- Guests: ${simulatedScenario?.guestCount} | Total Budget: ${currentPlan?.currency} ${simulatedScenario?.totalBudget}
-- Date: ${simulatedScenario?.eventDate} | Venue Type: ${simulatedScenario?.venuePreference}
-- Catering Tier: ${simulatedScenario?.cateringTier} | Priority Focus: ${simulatedScenario?.priorityFocus}
-- Calculated New Total Planned Spend: ${currentPlan?.currency} ${simulatedScenario?.projectedTotalSpend}
-- Calculated Remaining Balance: ${currentPlan?.currency} ${simulatedScenario?.projectedRemaining}
+- Guests: ${clampNumber(simulatedScenario.guestCount, 1, 100000, 100)} | Total Budget: ${sanitizeText(currentPlan.currency, 8, 'INR')} ${clampNumber(simulatedScenario.totalBudget, 0, 1_000_000_000, 100000)}
+- Date: ${sanitizeText(simulatedScenario.eventDate, 32, '2027-03-15')} | Venue Type: ${sanitizeText(simulatedScenario.venuePreference, 32, 'Hybrid')}
+- Catering Tier: ${sanitizeText(simulatedScenario.cateringTier, 60, 'Signature')} | Priority Focus: ${sanitizeText(simulatedScenario.priorityFocus, 240, 'Guest Experience')}
+- Calculated New Total Planned Spend: ${sanitizeText(currentPlan.currency, 8, 'INR')} ${clampNumber(simulatedScenario.projectedTotalSpend, 0, 1_000_000_000, 0)}
+- Calculated Remaining Balance: ${sanitizeText(currentPlan.currency, 8, 'INR')} ${clampNumber(simulatedScenario.projectedRemaining, -1_000_000_000, 1_000_000_000, 0)}
 
 Provide a clear 2-3 sentence trade-off analysis and 3 concrete recommendations.`;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+      const response = await generateWithGemini({
         contents: prompt,
         config: {
           systemInstruction:
@@ -640,15 +879,14 @@ Provide a clear 2-3 sentence trade-off analysis and 3 concrete recommendations.`
         },
       });
 
-      res.json({
-        ...JSON.parse(response.text || '{}'),
+      const result = {
+        ...(JSON.parse(response.text || '{}') as Record<string, unknown>),
         isDeterministicFallback: false,
-      });
-    } catch (error: any) {
-      console.error('Error in /api/ai/simulate-scenario:', error);
-      res.status(500).json({
-        error: error?.message || 'Failed to analyze scenario with AI.',
-      });
+      };
+      setCachedResponse(cacheKey, result);
+      res.json(result);
+    } catch {
+      res.json(buildFallbackScenario());
     }
   });
 
@@ -660,8 +898,13 @@ Provide a clear 2-3 sentence trade-off analysis and 3 concrete recommendations.`
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.use(
+      express.static(distPath, {
+        maxAge: '1d',
+        etag: true,
+      })
+    );
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -671,4 +914,6 @@ Provide a clear 2-3 sentence trade-off analysis and 3 concrete recommendations.`
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
