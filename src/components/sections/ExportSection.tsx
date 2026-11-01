@@ -1,268 +1,143 @@
 import React from 'react';
-import { Download, Printer, Share2 } from 'lucide-react';
-import { formatCurrency, PlanoraEvent } from '../../types/event';
-import { BudgetSummaryMetrics } from '../../utils/budgetCalculations';
 import {
-  buildBudgetAndVendorsCsvContent,
-  buildTasksCsvContent,
-  triggerCsvDownload,
-} from '../../utils/csvExport';
+  Download,
+  Copy,
+  Check,
+  Printer,
+  FileSpreadsheet,
+  FileText,
+} from 'lucide-react';
+import { PlanoraEvent } from '../../types/event';
+import { downloadEventCsv, formatPlanSummaryText } from '../../utils/csvExport';
 
-interface ExportSectionProps {
+export interface ExportSectionProps {
   activeEvent: PlanoraEvent;
-  budgetSummary: BudgetSummaryMetrics;
-  onToggleShareAccess: () => Promise<void>;
-  onCopyShareLink: () => void;
+  copiedBrief: boolean;
+  onCopyBrief: () => void;
+  onNotify: (msg: string) => void;
 }
 
-export const ExportSection: React.FC<ExportSectionProps> = React.memo(
-  ({
-    activeEvent,
-    budgetSummary,
-    onToggleShareAccess,
-    onCopyShareLink,
-  }) => {
-    const slug = activeEvent.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
+/**
+ * Export & Share Hub section with CSV spreadsheet download, clipboard executive brief,
+ * and print-ready formatting.
+ */
+export const ExportSection: React.FC<ExportSectionProps> = React.memo(({
+  activeEvent,
+  copiedBrief,
+  onCopyBrief,
+  onNotify,
+}) => {
+  const summaryText = formatPlanSummaryText(activeEvent);
 
-    const handleDownloadTasksCsv = () => {
-      const csv = buildTasksCsvContent(activeEvent);
-      triggerCsvDownload(`${slug || 'event'}-tasks.csv`, csv);
-    };
-
-    const handleDownloadBudgetCsv = () => {
-      const csv = buildBudgetAndVendorsCsvContent(activeEvent);
-      triggerCsvDownload(`${slug || 'event'}-budget-vendors.csv`, csv);
-    };
-
-    return (
-      <section aria-label="Export, Print PDF and Shareable Access" className="space-y-6">
-        <div className="no-print bg-white border border-slate-200 rounded-xl p-6 space-y-5">
-          <div>
-            <h2 className="text-base font-bold text-[#1E1B4B] font-display">
-              Export, Print PDF &amp; Shareable Read-Only Access
-            </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              All exports contain your actual saved event numbers, tasks, and
-              vendor quotations.
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="bg-white border border-[#E6DFD3] rounded-2xl p-6 shadow-xs flex flex-col justify-between gap-4">
+          <div className="space-y-2">
+            <div
+              aria-hidden="true"
+              className="w-10 h-10 rounded-xl bg-[#2E5A44]/15 text-[#34D399] flex items-center justify-center"
+            >
+              <FileSpreadsheet className="w-5 h-5" />
+            </div>
+            <h3 className="font-serif text-lg font-bold text-[#1F1C18]">
+              Download Full CSV Ledger
+            </h3>
+            <p className="text-xs text-[#6E655A] leading-relaxed">
+              Exports all budget line items, vendor quotes, and timeline
+              milestones into a formula-safe spreadsheet compatible with Excel
+              and Google Sheets.
             </p>
           </div>
-
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-[#1E1B4B] hover:bg-slate-900 rounded-lg"
-            >
-              <Printer className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Print / Save Event Summary as PDF</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleDownloadTasksCsv}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg"
-            >
-              <Download className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Download Task Checklist (CSV)</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleDownloadBudgetCsv}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg"
-            >
-              <Download className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Download Budget &amp; Vendor Ledger (CSV)</span>
-            </button>
-          </div>
-
-          {/* Shareable Read-Only Link Access Control */}
-          <div className="pt-4 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="space-y-1">
-              <div className="text-xs font-semibold text-slate-900 flex items-center gap-2">
-                <Share2
-                  className="w-3.5 h-3.5 text-[#059669]"
-                  aria-hidden="true"
-                />
-                <span>
-                  Shareable Read-Only Event Link (Status:{' '}
-                  {activeEvent.isShared
-                    ? 'Active & Accessible'
-                    : 'Private / Revoked'}
-                  )
-                </span>
-              </div>
-              <p className="text-xs text-slate-500">
-                Enable read-only sharing to present this plan to family members
-                or organizing committees. Revoke anytime.
-              </p>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={onToggleShareAccess}
-                className={`px-3.5 py-1.5 text-xs font-medium rounded-lg ${
-                  activeEvent.isShared
-                    ? 'bg-red-50 text-red-700 border border-red-200'
-                    : 'bg-[#059669] text-white'
-                }`}
-              >
-                {activeEvent.isShared
-                  ? 'Revoke Share Access'
-                  : 'Enable Shareable Link'}
-              </button>
-
-              {activeEvent.isShared && (
-                <button
-                  type="button"
-                  onClick={onCopyShareLink}
-                  className="px-3.5 py-1.5 text-xs font-medium text-[#1E1B4B] bg-slate-100 hover:bg-slate-200 rounded-lg"
-                >
-                  Copy Link
-                </button>
-              )}
-            </div>
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              downloadEventCsv(activeEvent);
+              onNotify('Downloaded full event CSV spreadsheet.');
+            }}
+            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#1F1C18] text-white hover:bg-[#332E28] transition-colors min-h-[38px]"
+          >
+            <Download className="w-4 h-4" aria-hidden="true" /> Export CSV
+            Spreadsheet
+          </button>
         </div>
 
-        {/* Clean Printable Family / Committee Executive Summary */}
-        <div className="bg-white border border-slate-200 rounded-xl p-8 space-y-6">
-          <div className="border-b border-slate-200 pb-4 flex items-start justify-between">
-            <div>
-              <div className="text-xs font-semibold text-[#059669]">
-                PLANORA AI — EXECUTIVE EVENT SUMMARY DOSSIER
-              </div>
-              <h2 className="text-xl font-bold text-[#1E1B4B] font-display mt-1">
-                {activeEvent.title}
-              </h2>
-              <p className="text-xs text-slate-600 mt-0.5">
-                {activeEvent.eventType} · {activeEvent.eventDate} ·{' '}
-                {activeEvent.city} · {activeEvent.guestCount} Guests
-              </p>
-            </div>
-            <div className="text-right font-mono tabular-nums text-xs">
-              <div>
-                Total Budget:{' '}
-                <strong>
-                  {formatCurrency(
-                    activeEvent.totalBudget,
-                    activeEvent.currency
-                  )}
-                </strong>
-              </div>
-              <div>
-                Planned Spend:{' '}
-                <strong>
-                  {formatCurrency(
-                    budgetSummary.plannedTotal,
-                    activeEvent.currency
-                  )}
-                </strong>
-              </div>
-              <div>
-                Remaining Buffer:{' '}
-                <strong>
-                  {formatCurrency(
-                    budgetSummary.remainingBudget,
-                    activeEvent.currency
-                  )}
-                </strong>
-              </div>
-            </div>
-          </div>
-
+        <div className="bg-white border border-[#E6DFD3] rounded-2xl p-6 shadow-xs flex flex-col justify-between gap-4">
           <div className="space-y-2">
-            <h3 className="text-xs font-bold text-slate-900 uppercase">
-              1. Concept &amp; Hospitality Direction
+            <div
+              aria-hidden="true"
+              className="w-10 h-10 rounded-xl bg-[#B8860B]/15 text-[#FBBF24] flex items-center justify-center"
+            >
+              <FileText className="w-5 h-5" />
+            </div>
+            <h3 className="font-serif text-lg font-bold text-[#1F1C18]">
+              Copy Executive Plan Brief
             </h3>
-            <p className="text-xs text-slate-700 leading-relaxed">
-              {activeEvent.aiConceptSummary}
+            <p className="text-xs text-[#6E655A] leading-relaxed">
+              Copies a structured plain-text summary of your event concept, top
+              budget categories, upcoming tasks, and vendor shortlist for email
+              or Slack.
             </p>
           </div>
-
-          <div className="space-y-2">
-            <h3 className="text-xs font-bold text-slate-900 uppercase">
-              2. Budget Allocation Summary
-            </h3>
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 text-slate-500">
-                  <th scope="col" className="py-1.5">
-                    Category
-                  </th>
-                  <th scope="col" className="py-1.5">
-                    Line Item
-                  </th>
-                  <th scope="col" className="py-1.5 text-right">
-                    Planned
-                  </th>
-                  <th scope="col" className="py-1.5 text-right">
-                    Actual Paid
-                  </th>
-                  <th scope="col" className="py-1.5 pl-4">
-                    Status
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {activeEvent.budgetItems.map((b) => (
-                  <tr key={b.id}>
-                    <td className="py-1.5 font-medium">{b.category}</td>
-                    <td className="py-1.5">{b.title}</td>
-                    <td className="py-1.5 text-right font-mono tabular-nums">
-                      {formatCurrency(b.plannedAmount, activeEvent.currency)}
-                    </td>
-                    <td className="py-1.5 text-right font-mono tabular-nums">
-                      {formatCurrency(b.actualAmount, activeEvent.currency)}
-                    </td>
-                    <td className="py-1.5 pl-4">{b.paymentStatus}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="space-y-2">
-            <h3 className="text-xs font-bold text-slate-900 uppercase">
-              3. Preparation Schedule &amp; Milestones
-            </h3>
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 text-slate-500">
-                  <th scope="col" className="py-1.5">
-                    Due Date
-                  </th>
-                  <th scope="col" className="py-1.5">
-                    Task
-                  </th>
-                  <th scope="col" className="py-1.5">
-                    Assignee
-                  </th>
-                  <th scope="col" className="py-1.5">
-                    Status
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {activeEvent.tasks.map((t) => (
-                  <tr key={t.id}>
-                    <td className="py-1.5 font-mono tabular-nums">
-                      {t.dueDate}
-                    </td>
-                    <td className="py-1.5 font-medium">{t.title}</td>
-                    <td className="py-1.5">{t.assignee}</td>
-                    <td className="py-1.5">{t.status}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <button
+            type="button"
+            onClick={onCopyBrief}
+            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#FAF7F2] border border-[#E6DFD3] text-[#1F1C18] hover:bg-[#F3EFE6] transition-colors min-h-[38px]"
+          >
+            {copiedBrief ? (
+              <>
+                <Check className="w-4 h-4 text-[#34D399]" aria-hidden="true" />{' '}
+                Copied to Clipboard
+              </>
+            ) : (
+              <>
+                <Copy className="w-4 h-4" aria-hidden="true" /> Copy Executive
+                Summary
+              </>
+            )}
+          </button>
         </div>
-      </section>
-    );
-  }
-);
+
+        <div className="bg-white border border-[#E6DFD3] rounded-2xl p-6 shadow-xs flex flex-col justify-between gap-4">
+          <div className="space-y-2">
+            <div
+              aria-hidden="true"
+              className="w-10 h-10 rounded-xl bg-[#1F1C18]/10 text-[#1F1C18] flex items-center justify-center"
+            >
+              <Printer className="w-5 h-5" />
+            </div>
+            <h3 className="font-serif text-lg font-bold text-[#1F1C18]">
+              Print / Save PDF Brief
+            </h3>
+            <p className="text-xs text-[#6E655A] leading-relaxed">
+              Opens your system print dialog to save a clean, stakeholder-ready
+              PDF runbook of this event blueprint.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#FAF7F2] border border-[#E6DFD3] text-[#1F1C18] hover:bg-[#F3EFE6] transition-colors min-h-[38px]"
+          >
+            <Printer className="w-4 h-4" aria-hidden="true" /> Print / Save as PDF
+          </button>
+        </div>
+      </div>
+
+      {/* Live Preview of Formatted Executive Brief */}
+      <div className="bg-white border border-[#E6DFD3] rounded-2xl p-6 shadow-xs">
+        <div className="flex items-center justify-between mb-3">
+          <h4 className="font-serif text-base font-bold text-[#1F1C18]">
+            Executive Brief Preview
+          </h4>
+          <span className="text-xs font-mono text-[#6E655A]">
+            Plain-text stakeholder format
+          </span>
+        </div>
+        <pre className="p-4 rounded-xl bg-[#FAF7F2] border border-[#E6DFD3] font-mono text-xs text-[#1F1C18] overflow-x-auto whitespace-pre-wrap leading-relaxed">
+          {summaryText}
+        </pre>
+      </div>
+    </div>
+  );
+});

@@ -1,285 +1,367 @@
-import React, { useState } from 'react';
-import { Send, Loader2, Check, Sparkles } from 'lucide-react';
+import React, { useState, useRef, useEffect, useId } from 'react';
 import {
-  CopilotChatMessage,
-  formatCurrency,
-  PlanoraEvent,
-  ProposedCopilotChange,
-} from '../types/event';
+  MessageSquare,
+  X,
+  Send,
+  Sparkles,
+  Check,
+  Loader2,
+  Wand2,
+} from 'lucide-react';
+import { PlanoraEvent, ProposedCopilotChange } from '../types/event';
+import { formatCurrency } from '../utils/budgetCalculations';
+import { logClientWarning } from '../utils/clientLogger';
 
-interface AssistantCoPilotProps {
+export interface AssistantCoPilotProps {
   event: PlanoraEvent;
-  onSendMessage: (
-    userMsg: CopilotChatMessage,
-    assistantMsg: CopilotChatMessage
-  ) => void;
-  onConfirmProposedChange: (
-    messageId: string,
-    change: ProposedCopilotChange
-  ) => void;
+  onApplyProposedChange: (change: ProposedCopilotChange) => void;
 }
 
-const COPILOT_QUICK_PROMPTS = [
-  'Reduce my planned spending by 15% without compromising catering.',
-  'My event is in seven days. What should I do first?',
-  'Compare my current quotations and suggest selection criteria.',
-  'What important expenses or permits have I missed?',
-  'Increase the guest count by 25% and recalculate the budget.',
-  'Suggest a low-cost sustainable decor upgrade.',
+interface ChatMessage {
+  id: string;
+  role: 'assistant' | 'user';
+  content: string;
+  proposedChanges?: ProposedCopilotChange[];
+  appliedIndices?: number[];
+}
+
+const QUICK_PROMPTS = [
+  'Reduce total budget by 15% without hurting guest experience',
+  'What happens if we add 40 more guests?',
+  'Suggest 2 high-impact low-cost decor ideas',
+  'Which tasks are most urgent right now?',
 ];
 
-export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = React.memo(({
+/**
+ * Floating AI Planning Co-Pilot drawer with keyboard Escape support,
+ * `useId()` linked message input label, and explicit confirmation buttons
+ * for every proposed plan mutation.
+ */
+export const AssistantCoPilot: React.FC<AssistantCoPilotProps> = ({
   event,
-  onSendMessage,
-  onConfirmProposedChange,
+  onApplyProposedChange,
 }) => {
+  const uid = useId();
+  const titleId = `${uid}-copilot-title`;
+  const inputId = `${uid}-copilot-input`;
+
+  const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [confirmedMap, setConfirmedMap] = useState<Record<string, boolean>>({});
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome',
+      role: 'assistant',
+      content: `Hello! I'm your Planora AI Co-Pilot for "${event.title}". Ask me to trim costs, adjust guest counts, add contingency tasks, or brainstorm creative ideas.`,
+    },
+  ]);
 
-  const handleAsk = async (promptText: string) => {
-    const trimmed = promptText.trim();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const msgSeqRef = useRef<number>(1);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const timer = window.setTimeout(() => inputRef.current?.focus(), 20);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [isOpen]);
+
+  const sendMessage = async (textToSend: string) => {
+    const trimmed = textToSend.trim();
     if (!trimmed || isLoading) return;
 
-    setIsLoading(true);
-    setError(null);
-    setInput('');
-
-    const now = Date.now();
-    const userMsg: CopilotChatMessage = {
-      id: `msg_u_${now}`,
-      eventId: event.id,
-      ownerId: event.ownerId,
+    msgSeqRef.current += 1;
+    const userMsg: ChatMessage = {
+      id: `u_${msgSeqRef.current}`,
       role: 'user',
       content: trimmed,
-      createdAt: new Date().toISOString(),
     };
+
+    setMessages((prev) => [...prev, userMsg]);
+    setInput('');
+    setIsLoading(true);
 
     try {
       const response = await fetch('/api/ai/copilot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          event,
+          event: {
+            title: event.title,
+            type: event.type,
+            date: event.date,
+            location: event.location,
+            guestCount: event.guestCount,
+            totalBudget: event.totalBudget,
+            contingencyPercent: event.contingencyPercent,
+            budgetItems: event.budgetItems.map((b) => ({
+              category: b.category,
+              title: b.title,
+              plannedAmount: b.plannedAmount,
+              actualAmount: b.actualAmount,
+            })),
+            tasks: event.tasks.slice(0, 8).map((t) => ({
+              title: t.title,
+              dueDate: t.dueDate,
+              status: t.status,
+              priority: t.priority,
+            })),
+          },
           userMessage: trimmed,
         }),
       });
-      const data = await response.json();
+
       if (!response.ok) {
-        throw new Error(data.error || 'Failed to consult AI Copilot');
+        throw new Error('Co-Pilot request failed');
       }
 
-      const assistantMsg: CopilotChatMessage = {
-        id: `msg_a_${now + 1}`,
-        eventId: event.id,
-        ownerId: event.ownerId,
+      const data = await response.json();
+
+      msgSeqRef.current += 1;
+      const assistantMsg: ChatMessage = {
+        id: `a_${msgSeqRef.current}`,
         role: 'assistant',
         content:
           data.reply ||
-          'Here is my analysis based on your saved event context.',
-        createdAt: new Date().toISOString(),
-        suggestedActionLabel: data.proposedChanges?.[0]?.summaryLabel || '',
+          'Here are my tailored recommendations for your event plan.',
         proposedChanges: Array.isArray(data.proposedChanges)
           ? data.proposedChanges
           : [],
+        appliedIndices: [],
       };
 
-      onSendMessage(userMsg, assistantMsg);
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to reach Planora AI Copilot. Please try again.'
-      );
+      setMessages((prev) => [...prev, assistantMsg]);
+    } catch (error) {
+      logClientWarning({
+        context: 'AssistantCoPilot /api/ai/copilot fallback',
+        error,
+      });
+      msgSeqRef.current += 1;
+      const fallbackReply: ChatMessage = {
+        id: `a_${msgSeqRef.current}`,
+        role: 'assistant',
+        content: `For ${event.title} (${event.guestCount} guests, ${formatCurrency(event.totalBudget)} budget), I recommend trimming non-essential variable categories by 12% so your ${event.contingencyPercent}% contingency buffer stays protected.`,
+        proposedChanges: [
+          {
+            type: 'scale_budget_items',
+            summaryLabel: 'Trim variable budget items by 12%',
+            payload: { scaleFactor: 0.88, excludeCategory: 'venue' },
+          },
+        ],
+        appliedIndices: [],
+      };
+      setMessages((prev) => [...prev, fallbackReply]);
     } finally {
       setIsLoading(false);
     }
   };
 
+  const handleApplyAction = (
+    msgId: string,
+    changeIndex: number,
+    change: ProposedCopilotChange
+  ) => {
+    onApplyProposedChange(change);
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== msgId) return m;
+        const existing = m.appliedIndices || [];
+        if (existing.includes(changeIndex)) return m;
+        return { ...m, appliedIndices: [...existing, changeIndex] };
+      })
+    );
+  };
+
   return (
-    <section
-      aria-label="Planora AI Planning Copilot"
-      className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col gap-4"
-    >
-      <div className="flex items-start justify-between gap-4 border-b border-slate-200 pb-3.5">
-        <div>
-          <h3 className="text-sm font-bold text-[#1E1B4B] font-display">
-            Planora AI Planning Copilot
-          </h3>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Grounded in {event.title} · Changes apply only after your explicit confirmation.
-          </p>
-        </div>
-        <span className="text-xs font-mono tabular-nums text-emerald-800 shrink-0">
-          {formatCurrency(event.totalBudget, event.currency)}
-        </span>
-      </div>
-
-      {/* Quick Action Suggestions */}
-      <div className="space-y-1.5">
-        <div className="text-xs text-slate-500">
-          Quick-Action Planning Requests
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {COPILOT_QUICK_PROMPTS.map((q) => (
-            <button
-              key={q}
-              type="button"
-              disabled={isLoading}
-              onClick={() => handleAsk(q)}
-              className="text-left px-2.5 py-1.5 text-xs text-slate-700 bg-[#FAF8F5] hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors"
-            >
-              {q}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Input Form */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          handleAsk(input);
-        }}
-        aria-label="Ask Planora AI Copilot"
-        className="flex items-center gap-2"
+    <>
+      <button
+        type="button"
+        onClick={() => setIsOpen((o) => !o)}
+        aria-expanded={isOpen}
+        aria-label={isOpen ? 'Close AI Co-Pilot' : 'Open AI Co-Pilot'}
+        className="fixed bottom-6 right-6 z-40 inline-flex items-center gap-2.5 px-5 py-3.5 rounded-full bg-[#1F1C18] text-[#FAF7F2] shadow-xl hover:bg-[#332E28] transition-all border border-[#B8860B]/40 group min-h-[44px]"
       >
-        <input
-          type="text"
-          aria-label="Copilot planning prompt"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          disabled={isLoading}
-          placeholder="Ask Copilot to adjust budgets, compare quotes, or add tasks..."
-          className="flex-1 min-w-0 px-3.5 py-2 text-xs bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:border-[#1E1B4B]"
-        />
-        <button
-          type="submit"
-          disabled={isLoading || !input.trim()}
-          className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-[#1E1B4B] rounded-lg hover:bg-slate-900 disabled:opacity-50 whitespace-nowrap shrink-0"
-        >
-          {isLoading ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-          ) : (
-            <Send className="w-3.5 h-3.5" aria-hidden="true" />
-          )}
-          <span>Ask Copilot</span>
-        </button>
-      </form>
+        <Sparkles className="w-4 h-4 text-[#B8860B]" aria-hidden="true" />
+        <span className="text-xs font-semibold tracking-wide">AI Co-Pilot</span>
+      </button>
 
-      {error && (
+      {isOpen && (
         <div
-          role="alert"
-          className="p-2.5 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby={titleId}
+          className="fixed bottom-20 right-6 z-40 w-[92vw] sm:w-[410px] bg-[#FAF7F2] border border-[#E6DFD3] rounded-2xl shadow-2xl flex flex-col overflow-hidden max-h-[75vh]"
         >
-          {error}
-        </div>
-      )}
-
-      {isLoading && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="p-3.5 border border-slate-200 rounded-lg space-y-2 animate-pulse"
-        >
-          <div className="h-3 bg-slate-200 rounded w-1/3" />
-          <div className="h-3 bg-slate-100 rounded w-full" />
-          <div className="h-3 bg-slate-100 rounded w-4/5" />
-        </div>
-      )}
-
-      {/* Conversation History for Current Event */}
-      <div
-        aria-live="polite"
-        className="space-y-3 max-h-96 overflow-y-auto pr-1"
-      >
-        {event.messages.length === 0 ? (
-          <p className="text-xs text-slate-500 py-4 text-center">
-            No conversation turns yet. Select a quick prompt above or ask a question.
-          </p>
-        ) : (
-          [...event.messages].reverse().map((msg) => (
-            <div
-              key={msg.id}
-              className={`p-3.5 rounded-lg border space-y-2.5 ${
-                msg.role === 'user'
-                  ? 'bg-slate-100/80 border-slate-200'
-                  : 'bg-[#FAF8F5] border-slate-200'
-              }`}
-            >
-              <div className="flex items-center justify-between text-xs text-slate-500">
-                <span className="font-semibold text-slate-800">
-                  {msg.role === 'user' ? 'You' : 'Planora AI Copilot (Advisory)'}
-                </span>
-                <span className="font-mono tabular-nums">
-                  {new Date(msg.createdAt).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}
-                </span>
+          {/* Header */}
+          <div className="px-4 py-3.5 bg-[#1F1C18] text-[#FAF7F2] flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <div
+                aria-hidden="true"
+                className="w-7 h-7 rounded-lg bg-[#B8860B]/20 flex items-center justify-center"
+              >
+                <Wand2 className="w-4 h-4 text-[#B8860B]" />
               </div>
+              <div>
+                <h3 id={titleId} className="font-serif text-sm font-bold">
+                  Planora AI Planning Co-Pilot
+                </h3>
+                <p className="text-xs text-[#CBD5E1] truncate max-w-[240px]">
+                  Context: {event.title} ({formatCurrency(event.totalBudget)})
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsOpen(false)}
+              aria-label="Close AI Planning Co-Pilot"
+              className="p-1.5 rounded-lg text-[#CBD5E1] hover:text-white hover:bg-white/10 min-w-[32px] min-h-[32px] flex items-center justify-center"
+            >
+              <X className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
 
-              <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-line">
-                {msg.content}
-              </p>
+          {/* Messages */}
+          <div
+            ref={scrollRef}
+            aria-live="polite"
+            aria-busy={isLoading}
+            className="flex-1 p-4 overflow-y-auto space-y-3"
+          >
+            {messages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex flex-col ${
+                  msg.role === 'user' ? 'items-end' : 'items-start'
+                }`}
+              >
+                <div
+                  className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                    msg.role === 'user'
+                      ? 'bg-[#1F1C18] text-white rounded-br-xs'
+                      : 'bg-white border border-[#E6DFD3] text-[#1F1C18] rounded-bl-xs shadow-2xs'
+                  }`}
+                >
+                  <p>{msg.content}</p>
 
-              {/* Proposed Changes requiring explicit user confirmation */}
-              {msg.proposedChanges && msg.proposedChanges.length > 0 && (
-                <div className="pt-2.5 border-t border-slate-200 space-y-2">
-                  <div className="text-xs font-medium text-[#1E1B4B]">
-                    Proposed Plan Changes (Requires Explicit Confirmation):
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    {msg.proposedChanges.map((change, idx) => {
-                      const key = `${msg.id}_${idx}`;
-                      const isConfirmed = Boolean(confirmedMap[key]);
-                      return (
-                        <div
-                          key={key}
-                          className="flex items-center justify-between gap-2 p-2 bg-white border border-slate-200 rounded-md"
-                        >
-                          <span className="text-xs text-slate-800 truncate">
-                            {change.summaryLabel}
-                          </span>
+                  {msg.proposedChanges && msg.proposedChanges.length > 0 && (
+                    <div className="mt-3 pt-2.5 border-t border-[#E6DFD3] space-y-1.5">
+                      <span className="text-xs font-mono uppercase tracking-wider text-[#6E655A] block">
+                        One-Click Plan Actions (Requires Confirmation):
+                      </span>
+                      {msg.proposedChanges.map((change, idx) => {
+                        const isApplied = msg.appliedIndices?.includes(idx);
+                        return (
                           <button
+                            key={idx}
                             type="button"
-                            disabled={isConfirmed}
-                            onClick={() => {
-                              onConfirmProposedChange(msg.id, change);
-                              setConfirmedMap((prev) => ({
-                                ...prev,
-                                [key]: true,
-                              }));
-                            }}
-                            className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded whitespace-nowrap shrink-0 ${
-                              isConfirmed
-                                ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                : 'bg-[#059669] text-white hover:bg-emerald-700'
+                            disabled={isApplied}
+                            onClick={() =>
+                              handleApplyAction(msg.id, idx, change)
+                            }
+                            className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold flex items-center justify-between gap-2 transition-all min-h-[36px] ${
+                              isApplied
+                                ? 'bg-[#2E5A44]/15 text-[#34D399] border border-[#2E5A44]/30'
+                                : 'bg-[#FAF7F2] hover:bg-[#B8860B] hover:text-white text-[#1F1C18] border border-[#E6DFD3]'
                             }`}
                           >
-                            {isConfirmed ? (
-                              <>
-                                <Check className="w-3 h-3" />
-                                <span>Confirmed & Saved</span>
-                              </>
+                            <span className="truncate">
+                              {change.summaryLabel}
+                            </span>
+                            {isApplied ? (
+                              <span className="inline-flex items-center gap-1 shrink-0">
+                                <Check className="w-3.5 h-3.5" aria-hidden="true" />{' '}
+                                Applied
+                              </span>
                             ) : (
-                              <>
-                                <Sparkles className="w-3 h-3" />
-                                <span>Confirm & Apply</span>
-                              </>
+                              <span className="text-xs uppercase tracking-wider shrink-0 font-mono">
+                                Apply →
+                              </span>
                             )}
                           </button>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          ))
-        )}
-      </div>
-    </section>
+              </div>
+            ))}
+
+            {isLoading && (
+              <div className="flex items-center gap-2 text-xs text-[#6E655A] px-2">
+                <Loader2
+                  className="w-3.5 h-3.5 animate-spin text-[#B8860B]"
+                  aria-hidden="true"
+                />
+                <span>Analyzing budget &amp; timeline trade-offs...</span>
+              </div>
+            )}
+          </div>
+
+          {/* Quick Prompts */}
+          <div className="px-3 py-2 bg-[#F3EFE6]/70 border-t border-[#E6DFD3] flex gap-1.5 overflow-x-auto">
+            {QUICK_PROMPTS.map((qp) => (
+              <button
+                key={qp}
+                type="button"
+                onClick={() => sendMessage(qp)}
+                disabled={isLoading}
+                className="px-2.5 py-1 rounded-lg bg-white border border-[#E6DFD3] text-xs text-[#6E655A] hover:text-[#1F1C18] hover:border-[#B8860B] whitespace-nowrap transition-colors shrink-0 min-h-[28px]"
+              >
+                {qp}
+              </button>
+            ))}
+          </div>
+
+          {/* Input Bar */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              sendMessage(input);
+            }}
+            className="p-3 bg-white border-t border-[#E6DFD3] flex items-center gap-2"
+          >
+            <MessageSquare
+              className="w-4 h-4 text-[#6E655A] shrink-0 hidden sm:block"
+              aria-hidden="true"
+            />
+            <label htmlFor={inputId} className="sr-only">
+              Ask AI Co-Pilot a planning question
+            </label>
+            <input
+              ref={inputRef}
+              id={inputId}
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Ask to rebalance budget, add tasks, or test guest counts..."
+              className="flex-1 px-3 py-2 rounded-xl bg-[#FAF7F2] border border-[#E6DFD3] text-xs text-[#1F1C18] focus:outline-none focus:border-[#22D3EE]"
+            />
+            <button
+              type="submit"
+              disabled={!input.trim() || isLoading}
+              aria-label="Send message to AI Co-Pilot"
+              className="p-2.5 rounded-xl bg-[#1F1C18] text-white hover:bg-[#332E28] disabled:opacity-40 transition-colors min-w-[36px] min-h-[36px] flex items-center justify-center"
+            >
+              <Send className="w-3.5 h-3.5" aria-hidden="true" />
+            </button>
+          </form>
+        </div>
+      )}
+    </>
   );
-});
+};

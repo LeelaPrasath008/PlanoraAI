@@ -1,580 +1,383 @@
 import {
   collection,
   doc,
-  getDoc,
   getDocs,
+  getDoc,
   setDoc,
-  updateDoc,
   deleteDoc,
+  onSnapshot,
   query,
   where,
+  writeBatch,
   serverTimestamp,
+  Timestamp,
 } from 'firebase/firestore';
+import { db, auth } from '../firebase';
 import {
-  db,
-  handleFirestoreError,
-  OperationType,
-} from '../lib/firebase';
-import {
-  BudgetExpenseItem,
-  CopilotChatMessage,
   PlanoraEvent,
-  PlanoraIdea,
-  PlanoraTask,
-  PlanoraVendor,
+  BudgetItem,
+  TimelineTask,
+  VendorItem,
+  CreativeIdea,
+  SavedScenario,
+  BookingStatus,
+  PaymentStatus,
+  TaskPriority,
+  TaskStatus,
 } from '../types/event';
+import {
+  sanitizeString,
+  clampNumber,
+  isValidEmail,
+  mapDocToEvent,
+  mapDocToBudgetItem,
+  mapDocToTask,
+  mapDocToVendor,
+  mapDocToIdea,
+  mapDocToScenario,
+} from './firestoreMappers';
+import { logClientError } from '../utils/clientLogger';
 
-const clampStr = (val: unknown, max: number, fallback = ''): string => {
-  const s = typeof val === 'string' ? val.trim() : fallback;
-  return (s || fallback).slice(0, max);
+export {
+  sanitizeString,
+  clampNumber,
+  isValidEmail,
+  mapDocToEvent,
+  mapDocToBudgetItem,
+  mapDocToTask,
+  mapDocToVendor,
+  mapDocToIdea,
+  mapDocToScenario,
 };
 
-export async function ensureUserProfile(
-  uid: string,
-  displayName: string,
-  email: string
-): Promise<void> {
-  const pubPath = `users/${uid}/public/profile`;
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  };
+}
+
+/**
+ * Formats and throws a structured JSON error payload for Firestore security or runtime failures.
+ */
+export function handleFirestoreError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null
+): never {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo:
+        auth.currentUser?.providerData.map((provider) => ({
+          providerId: provider.providerId,
+          displayName: provider.displayName,
+          email: provider.email,
+          photoUrl: provider.photoURL,
+        })) || [],
+    },
+    operationType,
+    path,
+  };
+  logClientError({ context: `Firestore ${operationType} at ${path}`, error });
+  throw new Error(JSON.stringify(errInfo));
+}
+
+const VALID_PAYMENT_STATUSES: PaymentStatus[] = ['Unpaid', 'Partial', 'Paid'];
+const VALID_TASK_PRIORITIES: TaskPriority[] = ['High', 'Medium', 'Low'];
+const VALID_TASK_STATUSES: TaskStatus[] = ['Todo', 'In Progress', 'Done'];
+const VALID_BOOKING_STATUSES: BookingStatus[] = [
+  'Shortlisted',
+  'Contacted',
+  'Negotiating',
+  'Booked',
+  'Declined',
+];
+
+/**
+ * Creates the user's profile document upon first sign-in if it does not already exist.
+ */
+export async function bootstrapUserProfile(user: {
+  uid: string;
+  displayName: string | null;
+  email: string | null;
+  photoURL: string | null;
+}): Promise<void> {
+  const path = `users/${user.uid}`;
   try {
-    const pubRef = doc(db, 'users', uid, 'public', 'profile');
-    const pubSnap = await getDoc(pubRef);
-    if (!pubSnap.exists()) {
-      await setDoc(pubRef, {
-        uid,
-        displayName: clampStr(displayName, 100, 'Planora Organizer'),
+    const userRef = doc(db, 'users', user.uid);
+    const snap = await getDoc(userRef);
+    if (!snap.exists()) {
+      const safeEmail = sanitizeString(user.email, 254, 'planner@planora.app');
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: sanitizeString(user.displayName, 100, 'Event Planner'),
+        email: isValidEmail(safeEmail) ? safeEmail : 'planner@planora.app',
+        photoURL: sanitizeString(user.photoURL, 500, ''),
+        role: 'planner',
         createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, pubPath);
-  }
-
-  if (email) {
-    const privPath = `users/${uid}/private/info`;
-    try {
-      const privRef = doc(db, 'users', uid, 'private', 'info');
-      const privSnap = await getDoc(privRef);
-      if (!privSnap.exists()) {
-        await setDoc(privRef, {
-          uid,
-          email: clampStr(email, 254, 'user@example.com'),
-          createdAt: serverTimestamp(),
-        });
-      }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, privPath);
-    }
+    handleFirestoreError(err, OperationType.WRITE, path);
   }
 }
 
-export async function fetchUserEventsFromFirestore(
-  uid: string
-): Promise<PlanoraEvent[]> {
-  const path = 'events';
-  try {
-    const q = query(collection(db, 'events'), where('ownerId', '==', uid));
-    const snap = await getDocs(q);
-    const events: PlanoraEvent[] = [];
-
-    for (const d of snap.docs) {
-      const data = d.data();
-      const eventId = d.id;
-
-      const [budgetSnap, taskSnap, vendorSnap, ideaSnap, msgSnap] =
-        await Promise.all([
-          getDocs(
-            query(
-              collection(db, 'events', eventId, 'budgetItems'),
-              where('ownerId', '==', uid)
-            )
-          ),
-          getDocs(
-            query(
-              collection(db, 'events', eventId, 'tasks'),
-              where('ownerId', '==', uid)
-            )
-          ),
-          getDocs(
-            query(
-              collection(db, 'events', eventId, 'vendors'),
-              where('ownerId', '==', uid)
-            )
-          ),
-          getDocs(
-            query(
-              collection(db, 'events', eventId, 'ideas'),
-              where('ownerId', '==', uid)
-            )
-          ),
-          getDocs(
-            query(
-              collection(db, 'events', eventId, 'messages'),
-              where('ownerId', '==', uid)
-            )
-          ),
-        ]);
-
-      events.push({
-        id: eventId,
-        ownerId: data.ownerId,
-        isDemo: false,
-        title: data.title,
-        description: data.description || '',
-        eventType: data.eventType || 'Wedding',
-        eventDate: data.eventDate || '2027-03-15',
-        durationHours: Number(data.durationHours) || 6,
-        city: data.city || 'Mumbai',
-        guestCount: Number(data.guestCount) || 100,
-        totalBudget: Number(data.totalBudget) || 100000,
-        currency: data.currency || 'INR',
-        themeStyle: data.themeStyle || '',
-        venuePreference: data.venuePreference || 'Hybrid',
-        foodPreference: data.foodPreference || '',
-        culturalNotes: data.culturalNotes || '',
-        mustHaves: data.mustHaves || '',
-        avoidItems: data.avoidItems || '',
-        priorities: data.priorities || 'Guest Experience, Affordability',
-        contingencyPercent: Number(data.contingencyPercent) || 8,
-        status: data.status || 'active',
-        isShared: Boolean(data.isShared),
-        shareToken: data.shareToken || '',
-        aiConceptSummary: data.aiConceptSummary || '',
-        aiRisksAndContingencies: data.aiRisksAndContingencies || '',
-        budgetItems: budgetSnap.docs.map(
-          (b) => ({ id: b.id, ...b.data() } as BudgetExpenseItem)
-        ),
-        tasks: taskSnap.docs.map(
-          (t) => ({ id: t.id, ...t.data() } as PlanoraTask)
-        ),
-        vendors: vendorSnap.docs.map(
-          (v) => ({ id: v.id, ...v.data() } as PlanoraVendor)
-        ),
-        ideas: ideaSnap.docs.map(
-          (i) => ({ id: i.id, ...i.data() } as PlanoraIdea)
-        ),
-        messages: msgSnap.docs.map((m) => {
-          const md = m.data();
-          return {
-            id: m.id,
-            eventId,
-            ownerId: md.ownerId,
-            role: md.role,
-            content: md.content,
-            suggestedActionLabel: md.suggestedActionLabel || '',
-            createdAt:
-              md.createdAt?.toDate?.()?.toISOString?.() ||
-              new Date().toISOString(),
-          } as CopilotChatMessage;
-        }),
-      });
-    }
-
-    return events;
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, path);
-  }
-}
-
-export async function saveFullEventToFirestore(
-  uid: string,
-  event: PlanoraEvent
+async function fetchEventSubcollections(
+  eventId: string,
+  baseEvent: PlanoraEvent
 ): Promise<PlanoraEvent> {
-  const cleanId = event.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100) || `evt_${Date.now()}`;
-  const eventPath = `events/${cleanId}`;
-
-  try {
-    const eventRef = doc(db, 'events', cleanId);
-    await setDoc(eventRef, {
-      ownerId: uid,
-      title: clampStr(event.title, 160, 'Untitled Event'),
-      description: clampStr(event.description, 1200, ''),
-      eventType: ['Wedding', 'Birthday', 'Anniversary', 'College Event', 'Festival', 'Community'].includes(
-        event.eventType
-      )
-        ? event.eventType
-        : 'Wedding',
-      eventDate: clampStr(event.eventDate, 32, '2027-03-15'),
-      durationHours: Math.min(240, Math.max(1, Number(event.durationHours) || 6)),
-      city: clampStr(event.city, 120, 'City'),
-      guestCount: Math.min(100000, Math.max(1, Number(event.guestCount) || 50)),
-      totalBudget: Math.min(1000000000, Math.max(0, Number(event.totalBudget) || 0)),
-      currency: ['INR', 'USD', 'EUR', 'GBP'].includes(event.currency)
-        ? event.currency
-        : 'INR',
-      themeStyle: clampStr(event.themeStyle, 300, ''),
-      venuePreference: ['Indoor', 'Outdoor', 'Hybrid'].includes(event.venuePreference)
-        ? event.venuePreference
-        : 'Hybrid',
-      foodPreference: clampStr(event.foodPreference, 400, ''),
-      culturalNotes: clampStr(event.culturalNotes, 500, ''),
-      mustHaves: clampStr(event.mustHaves, 500, ''),
-      avoidItems: clampStr(event.avoidItems, 500, ''),
-      priorities: clampStr(event.priorities, 300, 'Guest Experience'),
-      contingencyPercent: Math.min(50, Math.max(0, Number(event.contingencyPercent) || 8)),
-      status: ['active', 'archived', 'completed'].includes(event.status)
-        ? event.status
-        : 'active',
-      isShared: Boolean(event.isShared),
-      shareToken: clampStr(event.shareToken, 64, `shr_${Date.now()}`),
-      aiConceptSummary: clampStr(event.aiConceptSummary, 2000, ''),
-      aiRisksAndContingencies: clampStr(event.aiRisksAndContingencies, 2000, ''),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-
-    // Save subcollections concurrently via Promise.all for high efficiency
+  const [budgetSnap, tasksSnap, vendorsSnap, ideasSnap, scenariosSnap] =
     await Promise.all([
-      ...event.budgetItems.map((b) => saveBudgetItemToFirestore(uid, cleanId, b)),
-      ...event.tasks.map((t) => saveTaskToFirestore(uid, cleanId, t)),
-      ...event.vendors.map((v) => saveVendorToFirestore(uid, cleanId, v)),
-      ...event.ideas.map((idea) => saveIdeaToFirestore(uid, cleanId, idea)),
+      getDocs(collection(db, 'events', eventId, 'budgetItems')),
+      getDocs(collection(db, 'events', eventId, 'tasks')),
+      getDocs(collection(db, 'events', eventId, 'vendors')),
+      getDocs(collection(db, 'events', eventId, 'ideas')),
+      getDocs(collection(db, 'events', eventId, 'scenarios')),
     ]);
 
-    return {
-      ...event,
-      id: cleanId,
-      ownerId: uid,
-      isDemo: false,
-    };
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, eventPath);
-  }
+  return {
+    ...baseEvent,
+    budgetItems: budgetSnap.docs.map((d) => mapDocToBudgetItem(d.id, d.data())),
+    tasks: tasksSnap.docs.map((d) => mapDocToTask(d.id, d.data())),
+    vendors: vendorsSnap.docs.map((d) => mapDocToVendor(d.id, d.data())),
+    ideas: ideasSnap.docs.map((d) => mapDocToIdea(d.id, d.data())),
+    savedScenarios: scenariosSnap.docs.map((d) =>
+      mapDocToScenario(d.id, d.data())
+    ),
+  };
 }
 
-export async function fetchSharedEventFromFirestore(
-  eventId: string,
-  shareToken: string
-): Promise<PlanoraEvent | null> {
-  const cleanId = eventId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  if (!cleanId) return null;
-  try {
-    const snap = await getDoc(doc(db, 'events', cleanId));
-    if (!snap.exists()) return null;
-    const data = snap.data();
-    if (!data.isShared) return null;
-    if (shareToken && data.shareToken && data.shareToken !== shareToken) {
-      return null;
+/**
+ * Subscribes to all events owned by `ownerId` and loads their subcollections.
+ */
+export function subscribeUserEvents(
+  ownerId: string,
+  onEventsLoaded: (events: PlanoraEvent[]) => void,
+  onError?: (err: Error) => void
+): () => void {
+  const eventsQuery = query(
+    collection(db, 'events'),
+    where('ownerId', '==', ownerId)
+  );
+  return onSnapshot(
+    eventsQuery,
+    async (snapshot) => {
+      try {
+        const baseEvents = snapshot.docs.map((docSnap) =>
+          mapDocToEvent(docSnap.id, docSnap.data())
+        );
+        const fullEvents = await Promise.all(
+          baseEvents.map((ev) => fetchEventSubcollections(ev.id, ev))
+        );
+        fullEvents.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+        onEventsLoaded(fullEvents);
+      } catch (err) {
+        if (onError && err instanceof Error) onError(err);
+      }
+    },
+    (err) => {
+      if (onError) onError(err);
     }
-    return {
-      id: cleanId,
-      ownerId: String(data.ownerId || ''),
-      isDemo: false,
-      title: String(data.title || 'Shared Event'),
-      description: String(data.description || ''),
-      eventType: data.eventType || 'Wedding',
-      eventDate: String(data.eventDate || '2027-03-15'),
-      durationHours: Number(data.durationHours) || 6,
-      city: String(data.city || 'Mumbai'),
-      guestCount: Number(data.guestCount) || 100,
-      totalBudget: Number(data.totalBudget) || 100000,
-      currency: data.currency || 'INR',
-      themeStyle: String(data.themeStyle || ''),
-      venuePreference: data.venuePreference || 'Hybrid',
-      foodPreference: String(data.foodPreference || ''),
-      culturalNotes: String(data.culturalNotes || ''),
-      mustHaves: String(data.mustHaves || ''),
-      avoidItems: String(data.avoidItems || ''),
-      priorities: String(data.priorities || 'Guest Experience'),
-      contingencyPercent: Number(data.contingencyPercent) || 8,
-      status: data.status || 'active',
-      isShared: true,
-      shareToken: String(data.shareToken || ''),
-      aiConceptSummary: String(data.aiConceptSummary || ''),
-      aiRisksAndContingencies: String(data.aiRisksAndContingencies || ''),
-      budgetItems: [],
-      tasks: [],
-      vendors: [],
-      ideas: [],
-      messages: [],
-    };
-  } catch {
-    return null;
-  }
+  );
 }
 
-export async function updateEventMetadataInFirestore(
-  uid: string,
-  event: PlanoraEvent
-): Promise<void> {
-  const path = `events/${event.id}`;
-  try {
-    const ref = doc(db, 'events', event.id);
-    await updateDoc(ref, {
-      title: clampStr(event.title, 160, 'Untitled Event'),
-      description: clampStr(event.description, 1200, ''),
-      eventType: event.eventType,
-      eventDate: clampStr(event.eventDate, 32, '2027-03-15'),
-      durationHours: Math.min(240, Math.max(1, Number(event.durationHours) || 6)),
-      city: clampStr(event.city, 120, 'City'),
-      guestCount: Math.min(100000, Math.max(1, Number(event.guestCount) || 50)),
-      totalBudget: Math.min(1000000000, Math.max(0, Number(event.totalBudget) || 0)),
-      currency: event.currency,
-      themeStyle: clampStr(event.themeStyle, 300, ''),
-      venuePreference: event.venuePreference,
-      foodPreference: clampStr(event.foodPreference, 400, ''),
-      culturalNotes: clampStr(event.culturalNotes, 500, ''),
-      mustHaves: clampStr(event.mustHaves, 500, ''),
-      avoidItems: clampStr(event.avoidItems, 500, ''),
-      priorities: clampStr(event.priorities, 300, 'Guest Experience'),
-      contingencyPercent: Math.min(50, Math.max(0, Number(event.contingencyPercent) || 8)),
-      status: event.status,
-      isShared: Boolean(event.isShared),
-      shareToken: clampStr(event.shareToken, 64, ''),
-      aiConceptSummary: clampStr(event.aiConceptSummary, 2000, ''),
-      aiRisksAndContingencies: clampStr(event.aiRisksAndContingencies, 2000, ''),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, path);
-  }
-}
-
-export async function deleteEventFromFirestore(
-  _uid: string,
-  event: PlanoraEvent
-): Promise<void> {
-  const path = `events/${event.id}`;
-  try {
-    await Promise.all([
-      ...event.budgetItems.map((b) =>
-        deleteDoc(doc(db, 'events', event.id, 'budgetItems', b.id))
-      ),
-      ...event.tasks.map((t) =>
-        deleteDoc(doc(db, 'events', event.id, 'tasks', t.id))
-      ),
-      ...event.vendors.map((v) =>
-        deleteDoc(doc(db, 'events', event.id, 'vendors', v.id))
-      ),
-      ...event.ideas.map((i) =>
-        deleteDoc(doc(db, 'events', event.id, 'ideas', i.id))
-      ),
-      ...event.messages.map((m) =>
-        deleteDoc(doc(db, 'events', event.id, 'messages', m.id))
-      ),
-    ]);
-    await deleteDoc(doc(db, 'events', event.id));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, path);
-  }
-}
-
-export async function saveBudgetItemToFirestore(
-  uid: string,
+async function syncSubcollection<T extends { id: string }>(
   eventId: string,
-  item: BudgetExpenseItem,
-  isUpdate = false
+  subcollectionName: string,
+  items: T[],
+  ownerId: string,
+  serializeItem: (item: T) => Record<string, unknown>
 ): Promise<void> {
-  const cleanId = item.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  const path = `events/${eventId}/budgetItems/${cleanId}`;
-  try {
-    const ref = doc(db, 'events', eventId, 'budgetItems', cleanId);
-    const payload = {
-      category: clampStr(item.category, 80, 'General'),
-      title: clampStr(item.title, 160, 'Expense Item'),
-      plannedAmount: Math.max(0, Number(item.plannedAmount) || 0),
-      quotedAmount: Math.max(0, Number(item.quotedAmount) || 0),
-      actualAmount: Math.max(0, Number(item.actualAmount) || 0),
-      lowEstimate: Math.max(0, Number(item.lowEstimate) || 0),
-      highEstimate: Math.max(0, Number(item.highEstimate) || 0),
-      paymentStatus: ['Paid', 'Pending', 'Unpaid'].includes(item.paymentStatus)
-        ? item.paymentStatus
-        : 'Unpaid',
-      notes: clampStr(item.notes, 600, ''),
-      updatedAt: serverTimestamp(),
-    };
-    if (isUpdate) {
-      await updateDoc(ref, payload);
-    } else {
-      await setDoc(ref, {
-        ...payload,
-        eventId,
-        ownerId: uid,
-        createdAt: serverTimestamp(),
-      });
+  const colRef = collection(db, 'events', eventId, subcollectionName);
+  const existingSnap = await getDocs(colRef);
+  const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+  const incomingIds = new Set(items.map((i) => i.id));
+  const batch = writeBatch(db);
+
+  for (const existingDoc of existingSnap.docs) {
+    if (!incomingIds.has(existingDoc.id)) {
+      batch.delete(existingDoc.ref);
     }
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      isUpdate ? OperationType.UPDATE : OperationType.CREATE,
-      path
-    );
   }
-}
 
-export async function deleteSubcollectionDoc(
-  eventId: string,
-  subcollection: 'budgetItems' | 'tasks' | 'vendors' | 'ideas' | 'messages',
-  docId: string
-): Promise<void> {
-  const path = `events/${eventId}/${subcollection}/${docId}`;
-  try {
-    await deleteDoc(doc(db, 'events', eventId, subcollection, docId));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, path);
-  }
-}
-
-export async function saveTaskToFirestore(
-  uid: string,
-  eventId: string,
-  task: PlanoraTask,
-  isUpdate = false
-): Promise<void> {
-  const cleanId = task.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  const path = `events/${eventId}/tasks/${cleanId}`;
-  try {
-    const ref = doc(db, 'events', eventId, 'tasks', cleanId);
-    const payload = {
-      title: clampStr(task.title, 160, 'Task'),
-      description: clampStr(task.description, 600, ''),
-      dueDate: clampStr(task.dueDate, 32, '2027-01-01'),
-      durationDays: Math.min(
-        365,
-        Math.max(1, Math.round(Number(task.durationDays) || 7))
-      ),
-      priority: ['High', 'Medium', 'Low'].includes(task.priority)
-        ? task.priority
-        : 'Medium',
-      category: clampStr(task.category, 80, 'General'),
-      status: ['Todo', 'In Progress', 'Completed'].includes(task.status)
-        ? task.status
-        : 'Todo',
-      dependsOnTaskId: clampStr(task.dependsOnTaskId, 128, ''),
-      assignee: clampStr(task.assignee, 100, ''),
-      updatedAt: serverTimestamp(),
-    };
-    if (isUpdate) {
-      await updateDoc(ref, payload);
-    } else {
-      await setDoc(ref, {
-        ...payload,
-        eventId,
-        ownerId: uid,
-        createdAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      isUpdate ? OperationType.UPDATE : OperationType.CREATE,
-      path
-    );
-  }
-}
-
-export async function saveVendorToFirestore(
-  uid: string,
-  eventId: string,
-  vendor: PlanoraVendor,
-  isUpdate = false
-): Promise<void> {
-  const cleanId = vendor.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  const path = `events/${eventId}/vendors/${cleanId}`;
-  try {
-    const ref = doc(db, 'events', eventId, 'vendors', cleanId);
-    const payload = {
-      category: clampStr(vendor.category, 80, 'Venue'),
-      vendorName: clampStr(vendor.vendorName, 140, 'Vendor'),
-      contactInfo: clampStr(vendor.contactInfo, 200, ''),
-      estimatedPrice: Math.max(0, Number(vendor.estimatedPrice) || 0),
-      quotedAmount: Math.max(0, Number(vendor.quotedAmount) || 0),
-      bookingStatus: [
-        'Shortlisted',
-        'Inquiry Sent',
-        'Quoted',
-        'Booked',
-        'Declined',
-      ].includes(vendor.bookingStatus)
-        ? vendor.bookingStatus
-        : 'Shortlisted',
-      followUpDate: clampStr(vendor.followUpDate, 32, ''),
-      notes: clampStr(vendor.notes, 800, ''),
-      isAiSuggestion: Boolean(vendor.isAiSuggestion),
-      updatedAt: serverTimestamp(),
-    };
-    if (isUpdate) {
-      await updateDoc(ref, payload);
-    } else {
-      await setDoc(ref, {
-        ...payload,
-        eventId,
-        ownerId: uid,
-        createdAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      isUpdate ? OperationType.UPDATE : OperationType.CREATE,
-      path
-    );
-  }
-}
-
-export async function saveIdeaToFirestore(
-  uid: string,
-  eventId: string,
-  idea: PlanoraIdea,
-  isUpdate = false
-): Promise<void> {
-  const cleanId = idea.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  const path = `events/${eventId}/ideas/${cleanId}`;
-  try {
-    const ref = doc(db, 'events', eventId, 'ideas', cleanId);
-    const payload = {
-      category: [
-        'Decor',
-        'Food & Beverage',
-        'Entertainment',
-        'Invitations',
-        'Activities',
-      ].includes(idea.category)
-        ? idea.category
-        : 'Decor',
-      title: clampStr(idea.title, 160, 'Creative Idea'),
-      description: clampStr(idea.description, 800, ''),
-      estimatedCostImpact: clampStr(idea.estimatedCostImpact, 120, ''),
-      executionTip: clampStr(idea.executionTip, 500, ''),
-      updatedAt: serverTimestamp(),
-    };
-    if (isUpdate) {
-      await updateDoc(ref, payload);
-    } else {
-      await setDoc(ref, {
-        ...payload,
-        eventId,
-        ownerId: uid,
-        createdAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      isUpdate ? OperationType.UPDATE : OperationType.CREATE,
-      path
-    );
-  }
-}
-
-export async function saveCopilotMessageToFirestore(
-  uid: string,
-  eventId: string,
-  msg: CopilotChatMessage
-): Promise<void> {
-  const cleanId = msg.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 100);
-  const path = `events/${eventId}/messages/${cleanId}`;
-  try {
-    const ref = doc(db, 'events', eventId, 'messages', cleanId);
-    await setDoc(ref, {
+  for (const item of items) {
+    const itemRef = doc(db, 'events', eventId, subcollectionName, item.id);
+    const existingDoc = existingSnap.docs.find((d) => d.id === item.id);
+    const existingCreatedAt = existingDoc?.data()?.createdAt;
+    batch.set(itemRef, {
+      ...serializeItem(item),
+      ownerId,
       eventId,
-      ownerId: uid,
-      role: msg.role === 'user' ? 'user' : 'assistant',
-      content: clampStr(msg.content, 4000, 'Message'),
-      suggestedActionLabel: clampStr(msg.suggestedActionLabel || '', 200, ''),
-      createdAt: serverTimestamp(),
+      createdAt:
+        existingIds.has(item.id) && existingCreatedAt instanceof Timestamp
+          ? existingCreatedAt
+          : serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
+  }
+
+  await batch.commit();
+}
+
+/**
+ * Persists a complete `PlanoraEvent` and all 5 subcollections in parallel.
+ */
+export async function saveFullEventSubcollections(
+  ownerId: string,
+  event: PlanoraEvent,
+  isNew = false
+): Promise<void> {
+  const eventPath = `events/${event.id}`;
+  try {
+    const eventRef = doc(db, 'events', event.id);
+    let existingCreatedAt: Timestamp | null = null;
+    if (!isNew) {
+      const snap = await getDoc(eventRef);
+      if (snap.exists() && snap.data()?.createdAt instanceof Timestamp) {
+        existingCreatedAt = snap.data().createdAt;
+      }
+    }
+
+    await setDoc(eventRef, {
+      ownerId,
+      title: sanitizeString(event.title, 200, 'Untitled Event'),
+      type: sanitizeString(event.type, 100, 'Event'),
+      date: sanitizeString(event.date, 40, new Date().toISOString().split('T')[0]),
+      location: sanitizeString(event.location, 200, 'TBD'),
+      venuePreference: sanitizeString(event.venuePreference, 100, 'Indoor'),
+      guestCount: clampNumber(event.guestCount, 1, 100000, 50),
+      totalBudget: clampNumber(event.totalBudget, 0, 1000000000, 10000),
+      contingencyPercent: clampNumber(event.contingencyPercent, 0, 100, 10),
+      notes: sanitizeString(event.notes, 2000, ''),
+      priorities: Array.isArray(event.priorities)
+        ? event.priorities.slice(0, 20).map((p) => sanitizeString(p, 100))
+        : [],
+      aiConceptSummary: sanitizeString(event.aiConceptSummary, 5000, ''),
+      aiRisksAndContingencies: sanitizeString(event.aiRisksAndContingencies, 5000, ''),
+      createdAt: existingCreatedAt || serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await Promise.all([
+      syncSubcollection<BudgetItem>(event.id, 'budgetItems', event.budgetItems, ownerId, (b) => ({
+        category: sanitizeString(b.category, 100, 'General'),
+        title: sanitizeString(b.title, 200, 'Expense Item'),
+        plannedAmount: clampNumber(b.plannedAmount, 0, 1000000000, 0),
+        quotedAmount: clampNumber(b.quotedAmount, 0, 1000000000, 0),
+        actualAmount: clampNumber(b.actualAmount, 0, 1000000000, 0),
+        lowEstimate: clampNumber(b.lowEstimate, 0, 1000000000, 0),
+        highEstimate: clampNumber(b.highEstimate, 0, 1000000000, 0),
+        paymentStatus: VALID_PAYMENT_STATUSES.includes(b.paymentStatus) ? b.paymentStatus : 'Unpaid',
+        ...(b.dueDate ? { dueDate: sanitizeString(b.dueDate, 40) } : {}),
+        notes: sanitizeString(b.notes, 1000, ''),
+      })),
+      syncSubcollection<TimelineTask>(event.id, 'tasks', event.tasks, ownerId, (t) => ({
+        title: sanitizeString(t.title, 200, 'Task'),
+        description: sanitizeString(t.description, 1000, ''),
+        dueDate: sanitizeString(t.dueDate, 40, ''),
+        ...(t.durationDays !== undefined ? { durationDays: clampNumber(t.durationDays, 1, 365, 5) } : {}),
+        priority: VALID_TASK_PRIORITIES.includes(t.priority) ? t.priority : 'Medium',
+        category: sanitizeString(t.category, 100, 'General'),
+        status: VALID_TASK_STATUSES.includes(t.status) ? t.status : 'Todo',
+        assignee: sanitizeString(t.assignee, 100, ''),
+        ...(t.dependsOnTaskId ? { dependsOnTaskId: sanitizeString(t.dependsOnTaskId, 100) } : {}),
+      })),
+      syncSubcollection<VendorItem>(event.id, 'vendors', event.vendors, ownerId, (v) => ({
+        category: sanitizeString(v.category, 100, 'General'),
+        vendorName: sanitizeString(v.vendorName, 200, 'Vendor'),
+        contactInfo: sanitizeString(v.contactInfo, 300, ''),
+        estimatedPrice: clampNumber(v.estimatedPrice, 0, 1000000000, 0),
+        quotedAmount: clampNumber(v.quotedAmount, 0, 1000000000, 0),
+        bookingStatus: VALID_BOOKING_STATUSES.includes(v.bookingStatus) ? v.bookingStatus : 'Shortlisted',
+        followUpDate: sanitizeString(v.followUpDate, 40, ''),
+        notes: sanitizeString(v.notes, 1000, ''),
+      })),
+      syncSubcollection<CreativeIdea>(event.id, 'ideas', event.ideas, ownerId, (i) => ({
+        category: sanitizeString(i.category, 100, 'General'),
+        title: sanitizeString(i.title, 200, 'Idea'),
+        description: sanitizeString(i.description, 1000, ''),
+        estimatedCostImpact: sanitizeString(i.estimatedCostImpact, 200, ''),
+        executionTip: sanitizeString(i.executionTip, 1000, ''),
+      })),
+      syncSubcollection<SavedScenario>(event.id, 'scenarios', event.savedScenarios, ownerId, (s) => ({
+        name: sanitizeString(s.name, 200, 'Scenario'),
+        guestCount: clampNumber(s.guestCount, 1, 100000, 50),
+        totalBudget: clampNumber(s.totalBudget, 0, 1000000000, 10000),
+        venueTier: ['Budget', 'Standard', 'Premium'].includes(s.venueTier) ? s.venueTier : 'Standard',
+        cateringStyle: ['Buffet', 'Plated', 'Cocktail'].includes(s.cateringStyle) ? s.cateringStyle : 'Plated',
+        decorLevel: ['Minimal', 'Curated', 'Luxury'].includes(s.decorLevel) ? s.decorLevel : 'Curated',
+        estimatedTotalCost: clampNumber(s.estimatedTotalCost, 0, 1000000000, 0),
+        summaryNotes: sanitizeString(s.summaryNotes, 1000, ''),
+      })),
+    ]);
   } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, path);
+    handleFirestoreError(err, OperationType.WRITE, eventPath);
+  }
+}
+
+/**
+ * Deletes an event and all of its subcollection documents.
+ */
+export async function deleteFullEvent(eventId: string): Promise<void> {
+  const path = `events/${eventId}`;
+  try {
+    const subcollections = ['budgetItems', 'tasks', 'vendors', 'ideas', 'scenarios'];
+    for (const sub of subcollections) {
+      const snap = await getDocs(collection(db, 'events', eventId, sub));
+      if (!snap.empty) {
+        const batch = writeBatch(db);
+        snap.docs.forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+      }
+    }
+    await deleteDoc(doc(db, 'events', eventId));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, path);
+  }
+}
+
+/**
+ * Seeds sample initial plans into Firestore if the authenticated user has no saved events yet.
+ */
+export async function seedInitialPlansForUser(
+  ownerId: string,
+  samplePlans: PlanoraEvent[]
+): Promise<void> {
+  const q = query(collection(db, 'events'), where('ownerId', '==', ownerId));
+  const snap = await getDocs(q);
+  if (!snap.empty) return;
+  for (const plan of samplePlans) {
+    const clonedPlan: PlanoraEvent = {
+      ...plan,
+      id: `${plan.id}_${ownerId.slice(0, 6)}`,
+    };
+    await saveFullEventSubcollections(ownerId, clonedPlan, true);
   }
 }

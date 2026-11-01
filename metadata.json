@@ -1,6 +1,6 @@
 {
-  "name": "Aurelia Event Studio",
-  "description": "GenAI-powered event planning workspace for organizing weddings, milestone birthdays, and community gatherings with interactive budgets, production timelines, vendor checklists, and bespoke creative concepts.",
+  "name": "Planora AI",
+  "description": "Planora AI is a GenAI-powered event planning workspace for organizing weddings, milestone birthdays, college festivals, and community gatherings with interactive budgets, dependency graphs, draggable Gantt timelines, vendor comparisons, and scenario simulation.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

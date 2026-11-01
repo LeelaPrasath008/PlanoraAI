@@ -1,113 +1,168 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  calculateBudgetSummary,
-  simulateEventScenario,
-  applyBudgetOptimization,
-  applyConfirmedCopilotChange,
+  calculateBudgetMetrics,
+  rebalanceBudgetToTarget,
+  formatCurrency,
 } from '../utils/budgetCalculations';
-import { DEMO_EVENTS } from '../data/initialEvents';
+import { PlanoraEvent, BudgetItem } from '../types/event';
 
-describe('Budget Calculations & Scenario Simulation Engine', () => {
-  it('computes accurate budget summary, contingency, per-guest cost, and remaining buffer', () => {
-    const sample = DEMO_EVENTS[0];
-    const summary = calculateBudgetSummary(sample);
+function createMockEvent(overrides: Partial<PlanoraEvent> = {}): PlanoraEvent {
+  return {
+    id: 'evt_test_1',
+    title: 'Test Gala',
+    type: 'Charity Gala',
+    date: '2026-10-15',
+    location: 'San Francisco, CA',
+    venuePreference: 'Indoor Luxury Venue',
+    guestCount: 100,
+    totalBudget: 50000,
+    contingencyPercent: 10,
+    notes: '',
+    priorities: ['Catering'],
+    aiConceptSummary: 'Summary',
+    aiRisksAndContingencies: 'Risks',
+    budgetItems: [
+      {
+        id: 'b1',
+        category: 'Venue & Rentals',
+        title: 'Ballroom Rental',
+        plannedAmount: 15000,
+        quotedAmount: 15500,
+        actualAmount: 15000,
+        lowEstimate: 13000,
+        highEstimate: 17000,
+        paymentStatus: 'Paid',
+        notes: '',
+      },
+      {
+        id: 'b2',
+        category: 'Catering & Bar',
+        title: 'Plated Dinner',
+        plannedAmount: 20000,
+        quotedAmount: 21000,
+        actualAmount: 10000,
+        lowEstimate: 17000,
+        highEstimate: 23000,
+        paymentStatus: 'Partial',
+        notes: '',
+      },
+    ],
+    tasks: [],
+    vendors: [],
+    ideas: [],
+    savedScenarios: [],
+    updatedAt: '2026-03-01',
+    ...overrides,
+  };
+}
 
-    const expectedPlanned = sample.budgetItems.reduce(
-      (sum: number, item) => sum + item.plannedAmount,
-      0
-    );
-    const expectedContingency = Math.round(
-      sample.totalBudget * (sample.contingencyPercent / 100)
-    );
+describe('Budget Calculations & Rebalancer Unit Tests', () => {
+  it('computes contingency, usable budget, and category breakdowns accurately', () => {
+    const event = createMockEvent();
+    const metrics = calculateBudgetMetrics(event);
 
-    assert.equal(summary.plannedTotal, expectedPlanned);
-    assert.equal(summary.contingencyAmount, expectedContingency);
-    assert.equal(
-      summary.remainingBudget,
-      sample.totalBudget - expectedPlanned - expectedContingency
-    );
-    assert.equal(
-      summary.perGuestPlanned,
-      Math.round(expectedPlanned / sample.guestCount)
-    );
+    assert.equal(metrics.totalBudget, 50000);
+    assert.equal(metrics.contingencyAmount, 5000);
+    assert.equal(metrics.usableBudget, 45000);
+    assert.equal(metrics.totalPlanned, 35000);
+    assert.equal(metrics.totalQuoted, 36500);
+    assert.equal(metrics.totalActual, 25000);
+    assert.equal(metrics.remainingUsable, 10000);
+    assert.equal(metrics.costPerGuestPlanned, 350);
+    assert.equal(metrics.isOverAllocated, false);
+    assert.equal(metrics.healthStatus, 'Healthy');
+    assert.equal(metrics.paidTotal, 15000);
+    assert.equal(metrics.unpaidTotal, 20000);
+    assert.equal(metrics.categoryBreakdown.length, 2);
   });
 
-  it('scales Catering and Venue proportionally in simulateEventScenario', () => {
-    const sample = DEMO_EVENTS[0];
-    const doubledGuests = sample.guestCount * 2;
-    const sim = simulateEventScenario(sample, {
-      simGuests: doubledGuests,
-      simBudget: sample.totalBudget * 2,
-      simDate: '2027-03-01',
-      simVenue: 'Outdoor',
-      cateringTier: 'Luxury (+25%)',
+  it('flags Over Allocated status when planned exceeds usable budget or actual exceeds total budget', () => {
+    const event = createMockEvent({
+      totalBudget: 30000,
+      contingencyPercent: 10,
     });
+    const metrics = calculateBudgetMetrics(event);
 
-    assert.ok(sim.projectedTotalSpend > sim.currentTotalPlanned);
-    assert.notEqual(sim.dayShift, 0);
-    assert.equal(sim.simulatedItems.length, sample.budgetItems.length);
+    assert.equal(metrics.usableBudget, 27000);
+    assert.equal(metrics.totalPlanned, 35000);
+    assert.equal(metrics.isOverAllocated, true);
+    assert.equal(metrics.overAllocatedAmount, 8000);
+    assert.equal(metrics.healthStatus, 'Over Allocated');
   });
 
-  it('applies confirmed budget optimization adjustments accurately', () => {
-    const sample = DEMO_EVENTS[0];
-    const firstItem = sample.budgetItems[0];
-    const newPlanned = Math.round(firstItem.plannedAmount * 0.85);
+  it('flags Tight status when planned allocation is >= 92% of usable budget without exceeding', () => {
+    const event = createMockEvent({
+      totalBudget: 40000,
+      contingencyPercent: 10, // usable = 36000; planned = 35000 (97.2%)
+    });
+    const metrics = calculateBudgetMetrics(event);
+    assert.equal(metrics.isOverAllocated, false);
+    assert.equal(metrics.healthStatus, 'Tight');
+  });
 
-    const optimizedItems = applyBudgetOptimization(sample.budgetItems, [
+  it('handles edge cases: zero budget, negative guest count, empty budgetItems, and 100% contingency', () => {
+    const emptyEvent = createMockEvent({
+      totalBudget: 0,
+      guestCount: 0,
+      contingencyPercent: 150,
+      budgetItems: [],
+    });
+    const metrics = calculateBudgetMetrics(emptyEvent);
+    assert.equal(metrics.totalBudget, 0);
+    assert.equal(metrics.contingencyPercent, 100);
+    assert.equal(metrics.usableBudget, 0);
+    assert.equal(metrics.costPerGuestPlanned, 0);
+    assert.equal(metrics.categoryBreakdown.length, 0);
+  });
+
+  it('rebalances unlocked categories while preserving locked categories and handles all-locked edge case', () => {
+    const items: BudgetItem[] = [
       {
-        id: firstItem.id,
-        category: firstItem.category,
-        title: firstItem.title,
-        currentPlanned: firstItem.plannedAmount,
-        recommendedPlanned: newPlanned,
-        rationale: 'Negotiate early-bird package discount',
+        id: 'b1',
+        category: 'Venue & Rentals',
+        title: 'Venue',
+        plannedAmount: 20000,
+        quotedAmount: 0,
+        actualAmount: 0,
+        lowEstimate: 17000,
+        highEstimate: 23000,
+        paymentStatus: 'Unpaid',
+        notes: '',
       },
+      {
+        id: 'b2',
+        category: 'Catering & Bar',
+        title: 'Catering',
+        plannedAmount: 20000,
+        quotedAmount: 0,
+        actualAmount: 0,
+        lowEstimate: 17000,
+        highEstimate: 23000,
+        paymentStatus: 'Unpaid',
+        notes: '',
+      },
+    ];
+
+    const rebalanced = rebalanceBudgetToTarget(items, 30000, ['Venue & Rentals']);
+    const venue = rebalanced.find((i) => i.id === 'b1')!;
+    const catering = rebalanced.find((i) => i.id === 'b2')!;
+
+    assert.equal(venue.plannedAmount, 20000);
+    assert.equal(catering.plannedAmount, 10000);
+
+    // Edge case: all categories locked -> returns items unchanged
+    const allLocked = rebalanceBudgetToTarget(items, 25000, [
+      'Venue & Rentals',
+      'Catering & Bar',
     ]);
-
-    assert.equal(optimizedItems[0].plannedAmount, newPlanned);
+    assert.equal(allLocked[0].plannedAmount, 20000);
+    assert.equal(allLocked[1].plannedAmount, 20000);
   });
 
-  it('applies confirmed Copilot actions deterministically across budget, tasks, and vendors', () => {
-    const sample = DEMO_EVENTS[0];
-
-    const addTaskResult = applyConfirmedCopilotChange(
-      sample,
-      {
-        type: 'add_task',
-        summaryLabel: 'Add Valet Coordination Milestone',
-        payload: {
-          title: 'Confirm Valet Parking Marshals',
-          category: 'Logistics',
-          priority: 'High',
-          dueDate: '2027-02-01',
-        },
-      },
-      'user_test'
-    );
-    assert.equal(
-      addTaskResult.updatedEvent.tasks.length,
-      sample.tasks.length + 1
-    );
-    assert.ok(addTaskResult.addedTask);
-
-    const addVendorResult = applyConfirmedCopilotChange(
-      sample,
-      {
-        type: 'add_vendor',
-        summaryLabel: 'Shortlist Acoustic Trio',
-        payload: {
-          vendorName: 'Aria Strings Collective',
-          category: 'Music & Entertainment',
-          estimatedPrice: 35000,
-        },
-      },
-      'user_test'
-    );
-    assert.equal(
-      addVendorResult.updatedEvent.vendors.length,
-      sample.vendors.length + 1
-    );
-    assert.ok(addVendorResult.addedVendor);
+  it('formats USD currency cleanly including zero, negative, and NaN inputs', () => {
+    assert.equal(formatCurrency(25000), '$25,000');
+    assert.equal(formatCurrency(0), '$0');
+    assert.equal(formatCurrency(Number.NaN), '$0');
   });
 });

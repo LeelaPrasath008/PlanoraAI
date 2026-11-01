@@ -1,1482 +1,531 @@
-import React, {
-  useState,
-  useMemo,
-  useRef,
-  useEffect,
-  useCallback,
-} from 'react';
-import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
+import React, { useState, useMemo, useId } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import {
-  GitBranch,
-  Network,
   CheckCircle2,
   Clock,
+  Circle,
   Lock,
-  Unlock,
-  AlertTriangle,
-  ChevronRight,
-  ChevronDown,
-  Trash2,
+  Flame,
+  Calendar,
 } from 'lucide-react';
-import { PlanoraTask } from '../types/event';
+import { TimelineTask } from '../types/event';
 import {
-  analyzeTaskDependencyGraph,
-  wouldCreateCycle as checkCycle,
+  analyzeTaskSchedule,
+  wouldCreateDependencyCycle,
+  autoResolveScheduleConflicts,
+  inferLogicalDependencies,
 } from '../utils/taskScheduler';
+import { DagStatsAndToolbar } from './dag/DagStatsAndToolbar';
+import { DagTreeView } from './dag/DagTreeView';
+import { DagNodeInspector } from './dag/DagNodeInspector';
 
-interface TaskDependencyGraphProps {
-  tasks: PlanoraTask[];
-  eventDate: string;
-  isReadOnly?: boolean;
-  initialSubMode?: 'graph' | 'tree';
-  onUpdateTask: (updated: PlanoraTask) => Promise<void> | void;
-  onDeleteTask: (taskId: string) => Promise<void> | void;
+export interface TaskDependencyGraphProps {
+  tasks: TimelineTask[];
+  onToggleTaskStatus: (taskId: string) => void;
+  onSetTaskDependency: (
+    taskId: string,
+    dependsOnTaskId: string | undefined
+  ) => void;
+  onBulkUpdateTasks: (updatedTasks: TimelineTask[]) => void;
 }
 
-interface EdgeCoord {
-  id: string;
-  fromId: string;
-  toId: string;
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-  isBlocking: boolean;
-  prereqStatus: PlanoraTask['status'];
-  isCriticalPath: boolean;
-}
+const NODE_WIDTH = 248;
+const NODE_HEIGHT = 112;
+const COL_GAP = 92;
+const ROW_GAP = 26;
+const PAD_X = 36;
+const PAD_Y = 36;
 
-const NODE_SPRING = {
-  type: 'spring' as const,
-  stiffness: 340,
-  damping: 30,
-  mass: 0.85,
-};
+/**
+ * Interactive Task Dependency Graph (DAG) and Collapsible Hierarchy Tree.
+ * Provides accessible SVG role="img" with <title> and <desc>, keyboard-focusable
+ * task nodes, an equivalent screen-reader dependency list, and gentle pulse animations
+ * on overdue or blocked nodes.
+ */
+export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = ({
+  tasks,
+  onToggleTaskStatus,
+  onSetTaskDependency,
+  onBulkUpdateTasks,
+}) => {
+  const uid = useId();
+  const svgTitleId = `${uid}-dag-title`;
+  const svgDescId = `${uid}-dag-desc`;
 
-export const TaskDependencyGraph: React.FC<TaskDependencyGraphProps> = React.memo(
-  ({
-    tasks,
-    isReadOnly = false,
-    initialSubMode = 'graph',
-    onUpdateTask,
-    onDeleteTask,
-  }) => {
-    const [subMode, setSubMode] = useState<'graph' | 'tree'>(initialSubMode);
+  const [displayMode, setDisplayMode] = useState<'dag' | 'tree'>('dag');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
-  const [dependencyFilter, setDependencyFilter] = useState<
-    'all' | 'blocked' | 'overdue' | 'bottlenecks' | 'ready'
-  >('all');
-  const [highlightCriticalPath, setHighlightCriticalPath] =
-    useState<boolean>(true);
-  const [collapsedNodes, setCollapsedNodes] = useState<Record<string, boolean>>(
-    {}
-  );
+  const [filterMode, setFilterMode] = useState<'all' | 'critical' | 'blocked'>('all');
+  const [linkingSourceId, setLinkingSourceId] = useState<string | null>(null);
+  const [cycleError, setCycleError] = useState<string | null>(null);
+  const [collapsedTreeIds, setCollapsedTreeIds] = useState<Set<string>>(new Set());
 
-  const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const diagnostics = useMemo(() => analyzeTaskSchedule(tasks), [tasks]);
+  const taskMap = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
 
-  // Track tasks that recently changed status, connection, or unlocked state for subtle highlight animations
-  const [transientHighlights, setTransientHighlights] = useState<
-    Record<string, 'status' | 'connection' | 'unlocked'>
-  >({});
-  const prevTasksSnapshotRef = useRef<
-    Map<
-      string,
-      {
-        status: PlanoraTask['status'];
-        dependsOnTaskId: string;
-        isBlocked: boolean;
-      }
-    >
-  >(new Map());
+  const visibleTasks = useMemo(() => {
+    if (filterMode === 'all') return tasks;
+    if (filterMode === 'critical') {
+      return tasks.filter((t) => diagnostics.criticalPathIds.has(t.id));
+    }
+    return tasks.filter(
+      (t) =>
+        diagnostics.blockedTaskIds.has(t.id) ||
+        diagnostics.overdueTaskIds.has(t.id) ||
+        diagnostics.scheduleConflictIds.has(t.id) ||
+        (diagnostics.dependentCountMap.get(t.id) || 0) > 0
+    );
+  }, [tasks, filterMode, diagnostics]);
 
-  // Sync subMode when parent changes initialSubMode
-  useEffect(() => {
-    setSubMode(initialSubMode);
-  }, [initialSubMode]);
+  const dagLayout = useMemo(() => {
+    const columns = new Map<number, TimelineTask[]>();
+    let maxCol = 0;
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const nodeRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const [edges, setEdges] = useState<EdgeCoord[]>([]);
+    const sorted = [...visibleTasks].sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    for (const task of sorted) {
+      const depth = diagnostics.dependencyDepthMap.get(task.id) || 0;
+      if (depth > maxCol) maxCol = depth;
+      const list = columns.get(depth) || [];
+      list.push(task);
+      columns.set(depth, list);
+    }
 
-  const {
-    taskMap,
-    childrenMap,
-    downstreamCountMap,
-    criticalPathIds,
-    stages,
-    stats,
-  } = useMemo(
-    () => analyzeTaskDependencyGraph(tasks, todayIso),
-    [tasks, todayIso]
-  );
-
-  // Detect status changes, dependency connection updates, and newly unlocked downstream tasks
-  useEffect(() => {
-    const prevMap = prevTasksSnapshotRef.current;
-    const nextHighlights: Record<string, 'status' | 'connection' | 'unlocked'> =
-      {};
-
-    tasks.forEach((t) => {
-      const prereq = t.dependsOnTaskId
-        ? taskMap.get(t.dependsOnTaskId)
-        : undefined;
-      const isBlocked = Boolean(prereq && prereq.status !== 'Completed');
-      const prev = prevMap.get(t.id);
-
-      if (prev) {
-        if (prev.dependsOnTaskId !== t.dependsOnTaskId) {
-          nextHighlights[t.id] = 'connection';
-        } else if (prev.status !== t.status) {
-          nextHighlights[t.id] = 'status';
-        } else if (prev.isBlocked && !isBlocked) {
-          nextHighlights[t.id] = 'unlocked';
-        }
-      }
-
-      prevMap.set(t.id, {
-        status: t.status,
-        dependsOnTaskId: t.dependsOnTaskId,
-        isBlocked,
-      });
+    let maxRowsInAnyCol = 1;
+    columns.forEach((list) => {
+      if (list.length > maxRowsInAnyCol) maxRowsInAnyCol = list.length;
     });
 
-    if (Object.keys(nextHighlights).length > 0) {
-      setTransientHighlights((curr) => ({ ...curr, ...nextHighlights }));
-      const timer = setTimeout(() => {
-        setTransientHighlights((curr) => {
-          const copy = { ...curr };
-          Object.keys(nextHighlights).forEach((k) => delete copy[k]);
-          return copy;
-        });
-      }, 950);
-      return () => clearTimeout(timer);
-    }
-  }, [tasks, taskMap]);
+    const canvasWidth = Math.max(
+      760,
+      PAD_X * 2 + (maxCol + 1) * NODE_WIDTH + maxCol * COL_GAP
+    );
+    const canvasHeight = Math.max(
+      340,
+      PAD_Y * 2 + maxRowsInAnyCol * NODE_HEIGHT + (maxRowsInAnyCol - 1) * ROW_GAP
+    );
 
-  // Active focus task (hovered or clicked) and its connected upstream + downstream lineage
-  const activeFocusId = hoveredTaskId || selectedTaskId;
+    const positions = new Map<string, { x: number; y: number; depth: number }>();
+    for (let col = 0; col <= maxCol; col++) {
+      const colTasks = columns.get(col) || [];
+      const colTotalHeight =
+        colTasks.length * NODE_HEIGHT + Math.max(0, colTasks.length - 1) * ROW_GAP;
+      const startY = Math.max(PAD_Y, Math.round((canvasHeight - colTotalHeight) / 2));
 
-  const connectedLineageIds = useMemo(() => {
-    if (!activeFocusId) return null;
-    const set = new Set<string>([activeFocusId]);
-
-    // Walk upstream prerequisites
-    let curr = taskMap.get(activeFocusId);
-    const upSeen = new Set<string>();
-    while (curr && curr.dependsOnTaskId && !upSeen.has(curr.id)) {
-      upSeen.add(curr.id);
-      if (taskMap.has(curr.dependsOnTaskId)) {
-        set.add(curr.dependsOnTaskId);
-        curr = taskMap.get(curr.dependsOnTaskId);
-      } else {
-        break;
-      }
+      colTasks.forEach((task, rowIdx) => {
+        const x = PAD_X + col * (NODE_WIDTH + COL_GAP);
+        const y = startY + rowIdx * (NODE_HEIGHT + ROW_GAP);
+        positions.set(task.id, { x, y, depth: col });
+      });
     }
 
-    // Walk downstream dependents
-    const walkDown = (id: string, downSeen = new Set<string>()) => {
-      const children = childrenMap.get(id) || [];
-      for (const ch of children) {
-        if (!downSeen.has(ch.id)) {
-          downSeen.add(ch.id);
-          set.add(ch.id);
-          walkDown(ch.id, downSeen);
-        }
-      }
-    };
-    walkDown(activeFocusId);
+    const edges: Array<{
+      id: string;
+      fromId: string;
+      toId: string;
+      path: string;
+      midX: number;
+      midY: number;
+      isBlockedEdge: boolean;
+      isConflictEdge: boolean;
+      isCriticalEdge: boolean;
+    }> = [];
 
-    return set;
-  }, [activeFocusId, taskMap, childrenMap]);
+    for (const task of visibleTasks) {
+      if (!task.dependsOnTaskId) continue;
+      const fromPos = positions.get(task.dependsOnTaskId);
+      const toPos = positions.get(task.id);
+      if (!fromPos || !toPos) continue;
 
-  // Check if linking `taskId` to `candidatePrereqId` would create a cycle
-  const wouldCreateCycle = useCallback(
-    (taskId: string, candidatePrereqId: string): boolean =>
-      checkCycle(tasks, taskId, candidatePrereqId),
-    [tasks]
-  );
+      const startX = fromPos.x + NODE_WIDTH;
+      const startY = fromPos.y + NODE_HEIGHT / 2;
+      const endX = toPos.x;
+      const endY = toPos.y + NODE_HEIGHT / 2;
+      const deltaX = Math.max(48, Math.abs(endX - startX) * 0.5);
+      const path = `M ${startX} ${startY} C ${startX + deltaX} ${startY}, ${endX - deltaX} ${endY}, ${endX} ${endY}`;
 
-  // Recalculate SVG edge coordinates whenever layout, tasks, filter, or window size changes
-  const recomputeEdges = useCallback(() => {
-    if (!containerRef.current || subMode !== 'graph') return;
-    const containerRect = containerRef.current.getBoundingClientRect();
-    const nextEdges: EdgeCoord[] = [];
-
-    tasks.forEach((task) => {
-      if (!task.dependsOnTaskId) return;
-      const prereq = taskMap.get(task.dependsOnTaskId);
-      if (!prereq) return;
-
-      const fromEl = nodeRefs.current[prereq.id];
-      const toEl = nodeRefs.current[task.id];
-      if (!fromEl || !toEl) return;
-
-      const fromRect = fromEl.getBoundingClientRect();
-      const toRect = toEl.getBoundingClientRect();
-
-      const isHorizontal = toRect.left > fromRect.right - 20;
-      const x1 = isHorizontal
-        ? fromRect.right - containerRect.left
-        : fromRect.left + fromRect.width / 2 - containerRect.left;
-      const y1 = isHorizontal
-        ? fromRect.top + fromRect.height / 2 - containerRect.top
-        : fromRect.bottom - containerRect.top;
-      const x2 = isHorizontal
-        ? toRect.left - containerRect.left
-        : toRect.left + toRect.width / 2 - containerRect.left;
-      const y2 = isHorizontal
-        ? toRect.top + toRect.height / 2 - containerRect.top
-        : toRect.top - containerRect.top;
-
-      nextEdges.push({
-        id: `${prereq.id}->${task.id}`,
-        fromId: prereq.id,
+      edges.push({
+        id: `${task.dependsOnTaskId}->${task.id}`,
+        fromId: task.dependsOnTaskId,
         toId: task.id,
-        x1,
-        y1,
-        x2,
-        y2,
-        isBlocking: prereq.status !== 'Completed',
-        prereqStatus: prereq.status,
-        isCriticalPath:
-          criticalPathIds.has(prereq.id) && criticalPathIds.has(task.id),
+        path,
+        midX: (startX + endX) / 2,
+        midY: (startY + endY) / 2,
+        isBlockedEdge: diagnostics.blockedTaskIds.has(task.id),
+        isConflictEdge: diagnostics.scheduleConflictIds.has(task.id),
+        isCriticalEdge:
+          diagnostics.criticalPathIds.has(task.id) &&
+          diagnostics.criticalPathIds.has(task.dependsOnTaskId),
       });
-    });
-
-    setEdges(nextEdges);
-  }, [tasks, taskMap, subMode, criticalPathIds]);
-
-  // Event-driven edge measurement using a single RAF + post-transition settle + ResizeObserver (zero continuous RAF polling)
-  useEffect(() => {
-    if (subMode !== 'graph') return;
-    const rafId = requestAnimationFrame(recomputeEdges);
-    const settleTimer = window.setTimeout(recomputeEdges, 280);
-
-    let observer: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
-      observer = new ResizeObserver(() => {
-        requestAnimationFrame(recomputeEdges);
-      });
-      observer.observe(containerRef.current);
     }
 
-    window.addEventListener('resize', recomputeEdges);
-    return () => {
-      cancelAnimationFrame(rafId);
-      window.clearTimeout(settleTimer);
-      observer?.disconnect();
-      window.removeEventListener('resize', recomputeEdges);
-    };
-  }, [recomputeEdges, tasks, dependencyFilter, subMode, selectedTaskId]);
+    return { positions, edges, canvasWidth, canvasHeight, maxCol };
+  }, [visibleTasks, diagnostics]);
 
-  const cycleTaskStatus = async (task: PlanoraTask) => {
-    if (isReadOnly) return;
-    const order: PlanoraTask['status'][] = ['Todo', 'In Progress', 'Completed'];
-    const nextStatus = order[(order.indexOf(task.status) + 1) % order.length];
-    await onUpdateTask({ ...task, status: nextStatus });
+  const treeRoots = useMemo(() => {
+    const childrenByParentId = new Map<string, TimelineTask[]>();
+    const roots: TimelineTask[] = [];
+    const sorted = [...visibleTasks].sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    const visibleSet = new Set(visibleTasks.map((t) => t.id));
+
+    for (const t of sorted) {
+      if (t.dependsOnTaskId && visibleSet.has(t.dependsOnTaskId)) {
+        const list = childrenByParentId.get(t.dependsOnTaskId) || [];
+        list.push(t);
+        childrenByParentId.set(t.dependsOnTaskId, list);
+      } else {
+        roots.push(t);
+      }
+    }
+    return { roots, childrenByParentId };
+  }, [visibleTasks]);
+
+  const activeHighlightChain = useMemo(() => {
+    const targetId = hoveredTaskId || selectedTaskId;
+    const highlighted = new Set<string>();
+    if (!targetId) return highlighted;
+    highlighted.add(targetId);
+
+    let curr = taskMap.get(targetId);
+    const seenUp = new Set<string>();
+    while (curr?.dependsOnTaskId && !seenUp.has(curr.dependsOnTaskId)) {
+      seenUp.add(curr.dependsOnTaskId);
+      highlighted.add(curr.dependsOnTaskId);
+      curr = taskMap.get(curr.dependsOnTaskId);
+    }
+
+    const queue = [targetId];
+    const seenDown = new Set<string>([targetId]);
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      for (const t of tasks) {
+        if (t.dependsOnTaskId === parentId && !seenDown.has(t.id)) {
+          seenDown.add(t.id);
+          highlighted.add(t.id);
+          queue.push(t.id);
+        }
+      }
+    }
+    return highlighted;
+  }, [hoveredTaskId, selectedTaskId, taskMap, tasks]);
+
+  const handleNodeActivate = (task: TimelineTask) => {
+    setCycleError(null);
+    if (linkingSourceId) {
+      if (linkingSourceId === task.id) {
+        setLinkingSourceId(null);
+        return;
+      }
+      if (wouldCreateDependencyCycle(tasks, task.id, linkingSourceId)) {
+        setCycleError(
+          `Cannot make "${task.title}" depend on "${taskMap.get(linkingSourceId)?.title}" because it would create a circular dependency.`
+        );
+        setLinkingSourceId(null);
+        return;
+      }
+      onSetTaskDependency(task.id, linkingSourceId);
+      setLinkingSourceId(null);
+      setSelectedTaskId(task.id);
+      return;
+    }
+    setSelectedTaskId((prev) => (prev === task.id ? null : task.id));
   };
 
-  const matchesFilter = (task: PlanoraTask): boolean => {
-    if (dependencyFilter === 'all') return true;
-    const prereq = task.dependsOnTaskId
-      ? taskMap.get(task.dependsOnTaskId)
-      : undefined;
-    const isBlocked = Boolean(prereq && prereq.status !== 'Completed');
-    const isOverdue = task.status !== 'Completed' && task.dueDate < todayIso;
-    const dependents = childrenMap.get(task.id) || [];
-
-    if (dependencyFilter === 'blocked') {
-      return task.status !== 'Completed' && isBlocked;
-    }
-    if (dependencyFilter === 'overdue') {
-      return isOverdue;
-    }
-    if (dependencyFilter === 'bottlenecks') {
-      return task.status !== 'Completed' && dependents.length > 0;
-    }
-    if (dependencyFilter === 'ready') {
-      return task.status !== 'Completed' && !isBlocked;
-    }
-    return true;
-  };
-
-  const selectedTask = selectedTaskId ? taskMap.get(selectedTaskId) : null;
-
-  // Root tasks for Tree View
-  const rootTasks = useMemo(() => {
-    return tasks
-      .filter((t) => !t.dependsOnTaskId || !taskMap.has(t.dependsOnTaskId))
-      .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
-  }, [tasks, taskMap]);
-
-  // Recursive Tree Node Renderer
-  const renderTreeNode = (
-    task: PlanoraTask,
-    level: number,
-    visited = new Set<string>()
-  ): React.ReactNode => {
-    if (visited.has(task.id)) return null;
-    visited.add(task.id);
-
-    const children = (childrenMap.get(task.id) || []).sort((a, b) =>
-      a.dueDate.localeCompare(b.dueDate)
-    );
-    const prereq = task.dependsOnTaskId
-      ? taskMap.get(task.dependsOnTaskId)
-      : undefined;
-    const isBlocked = Boolean(prereq && prereq.status !== 'Completed');
-    const isCollapsed = Boolean(collapsedNodes[task.id]);
-    const isVisibleByFilter = matchesFilter(task);
-    const downstreamTotal = downstreamCountMap.get(task.id) || 0;
-    const highlightState = transientHighlights[task.id];
-    const isOverdue = task.status !== 'Completed' && task.dueDate < todayIso;
-    const needsUrgentPulse = task.status !== 'Completed' && (isOverdue || isBlocked);
-
-    return (
-      <motion.div
-        key={task.id}
-        layoutId={`tree-node-${task.id}`}
-        layout="position"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{
-          opacity: isVisibleByFilter ? 1 : 0.4,
-          y: 0,
-          scale: highlightState ? 1.012 : 1,
-        }}
-        exit={{ opacity: 0, y: -8 }}
-        transition={NODE_SPRING}
-        className="relative"
-      >
-        <motion.div
-          animate={{
-            backgroundColor:
-              selectedTaskId === task.id
-                ? '#FFFFFF'
-                : highlightState === 'unlocked' || highlightState === 'status'
-                ? '#ECFDF5'
-                : highlightState === 'connection'
-                ? '#EEF2FF'
-                : isOverdue
-                ? '#FEF2F2'
-                : isBlocked && task.status !== 'Completed'
-                ? '#FFFBEB'
-                : task.status === 'Completed'
-                ? '#F0FDF4'
-                : '#FFFFFF',
-            borderColor:
-              selectedTaskId === task.id
-                ? '#1E1B4B'
-                : highlightState === 'unlocked' || highlightState === 'status'
-                ? '#059669'
-                : highlightState === 'connection'
-                ? '#4F46E5'
-                : isOverdue
-                ? '#FCA5A5'
-                : isBlocked && task.status !== 'Completed'
-                ? '#FCD34D'
-                : task.status === 'Completed'
-                ? '#86EFAC'
-                : '#E2E8F0',
-          }}
-          transition={{ duration: 0.32, ease: 'easeOut' }}
-          className={`flex items-start gap-3 p-4 rounded-xl border ${
-            selectedTaskId === task.id
-              ? 'shadow-md'
-              : isOverdue
-              ? 'task-pulse-overdue'
-              : isBlocked && task.status !== 'Completed'
-              ? 'task-pulse-blocked'
-              : 'hover:shadow-xs'
-          }`}
-        >
-          {/* Collapse / Expand toggle if task has children */}
-          <button
-            type="button"
-            onClick={() =>
-              setCollapsedNodes((prev) => ({
-                ...prev,
-                [task.id]: !prev[task.id],
-              }))
-            }
-            disabled={children.length === 0}
-            className={`mt-0.5 p-1 rounded-md transition-colors ${
-              children.length > 0
-                ? 'text-[#1E1B4B] hover:bg-slate-100 cursor-pointer'
-                : 'text-slate-300 cursor-default'
-            }`}
-            aria-label={
-              isCollapsed ? 'Expand dependent tasks' : 'Collapse dependent tasks'
-            }
-          >
-            {children.length > 0 ? (
-              isCollapsed ? (
-                <ChevronRight className="w-4 h-4" />
-              ) : (
-                <ChevronDown className="w-4 h-4" />
-              )
-            ) : (
-              <GitBranch className="w-3.5 h-3.5" />
-            )}
-          </button>
-
-          {/* Status Quick-Toggle Button with gentle pulse when overdue or blocked */}
-          <motion.button
-            type="button"
-            whileHover={{ scale: 1.08 }}
-            whileTap={{ scale: 0.9 }}
-            animate={
-              needsUrgentPulse
-                ? { scale: [1, 1.08, 1] }
-                : { scale: 1 }
-            }
-            transition={
-              needsUrgentPulse
-                ? { duration: 2.2, repeat: Infinity, ease: 'easeInOut' }
-                : { duration: 0.2 }
-            }
-            onClick={() => cycleTaskStatus(task)}
-            title="Click to cycle status (Todo → In Progress → Completed)"
-            className={`mt-0.5 w-6 h-6 rounded-lg flex items-center justify-center shrink-0 transition-colors ${
-              task.status === 'Completed'
-                ? 'bg-[#059669] text-white'
-                : isOverdue
-                ? 'bg-red-100 text-red-700 border border-red-300'
-                : task.status === 'In Progress'
-                ? 'bg-[#1E1B4B] text-white'
-                : isBlocked
-                ? 'bg-amber-100 text-amber-800 border border-amber-300'
-                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`}
-          >
-            <AnimatePresence mode="wait" initial={false}>
-              <motion.span
-                key={`${task.status}-${isOverdue ? 'overdue' : isBlocked ? 'blocked' : 'open'}`}
-                initial={{ scale: 0.5, opacity: 0, rotate: -25 }}
-                animate={{ scale: 1, opacity: 1, rotate: 0 }}
-                exit={{ scale: 0.5, opacity: 0, rotate: 25 }}
-                transition={{ duration: 0.18 }}
-                className="flex items-center justify-center"
-              >
-                {task.status === 'Completed' ? (
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                ) : isOverdue ? (
-                  <AlertTriangle className="w-3.5 h-3.5" />
-                ) : isBlocked ? (
-                  <Lock className="w-3.5 h-3.5" />
-                ) : (
-                  <Clock className="w-3.5 h-3.5" />
-                )}
-              </motion.span>
-            </AnimatePresence>
-          </motion.button>
-
-          {/* Main Task Info */}
-          <div
-            className="flex-1 min-w-0 cursor-pointer"
-            onClick={() =>
-              setSelectedTaskId((prev) => (prev === task.id ? null : task.id))
-            }
-          >
-            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono tabular-nums">
-              <span className="font-semibold text-[#1E1B4B]">
-                Stage 0{level + 1}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span className={isOverdue ? 'text-red-700 font-semibold' : ''}>
-                Due {task.dueDate}
-              </span>
-              {isOverdue && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="text-red-600 font-semibold">
-                    Overdue · Action Required
-                  </span>
-                </>
-              )}
-              <span aria-hidden="true">·</span>
-              <span>{task.category}</span>
-              <span aria-hidden="true">·</span>
-              <span>{task.priority} Priority</span>
-              {task.assignee && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>Owner: {task.assignee}</span>
-                </>
-              )}
-            </div>
-
-            <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
-              <h4
-                className={`text-sm font-bold font-display transition-colors duration-200 ${
-                  task.status === 'Completed'
-                    ? 'line-through text-slate-500'
-                    : 'text-slate-900'
-                }`}
-              >
-                {task.title}
-              </h4>
-
-              <div className="flex items-center gap-3 text-xs">
-                <AnimatePresence mode="wait" initial={false}>
-                  {isBlocked && prereq ? (
-                    <motion.span
-                      key={`blocked-${prereq.id}`}
-                      initial={{ opacity: 0, y: 4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -4 }}
-                      transition={{ duration: 0.18 }}
-                      className="text-amber-800 font-medium inline-flex items-center gap-1"
-                    >
-                      <Lock className="w-3 h-3" />
-                      <span>Blocked by “{prereq.title.slice(0, 26)}”</span>
-                    </motion.span>
-                  ) : prereq ? (
-                    <motion.span
-                      key={`unlocked-${prereq.id}`}
-                      initial={{ opacity: 0, y: 4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -4 }}
-                      transition={{ duration: 0.18 }}
-                      className="text-emerald-700 font-medium inline-flex items-center gap-1"
-                    >
-                      <Unlock className="w-3 h-3" />
-                      <span>Prerequisite Complete</span>
-                    </motion.span>
-                  ) : (
-                    <motion.span
-                      key="root"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="text-slate-500"
-                    >
-                      Root Milestone
-                    </motion.span>
-                  )}
-                </AnimatePresence>
-
-                {downstreamTotal > 0 && (
-                  <span
-                    className={`font-mono tabular-nums font-semibold transition-colors duration-200 ${
-                      task.status === 'Completed'
-                        ? 'text-emerald-700'
-                        : 'text-[#1E1B4B]'
-                    }`}
-                  >
-                    {task.status === 'Completed'
-                      ? `Unlocked ${downstreamTotal} downstream`
-                      : `Blocks ${downstreamTotal} downstream`}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {task.description && (
-              <p className="mt-1 text-xs text-slate-600 leading-relaxed">
-                {task.description}
-              </p>
-            )}
-          </div>
-
-          {/* Inline Controls */}
-          <div className="flex items-center gap-2 shrink-0">
-            <select
-              disabled={isReadOnly}
-              value={task.dependsOnTaskId}
-              onChange={(e) =>
-                onUpdateTask({ ...task, dependsOnTaskId: e.target.value })
-              }
-              className="px-2 py-1 text-xs bg-slate-50 border border-slate-200 rounded-md max-w-[150px] truncate"
-              title="Change prerequisite task"
-            >
-              <option value="">No Prerequisite (Root)</option>
-              {tasks
-                .filter(
-                  (cand) =>
-                    cand.id !== task.id && !wouldCreateCycle(task.id, cand.id)
-                )
-                .map((cand) => (
-                  <option key={cand.id} value={cand.id}>
-                    After: {cand.title.slice(0, 25)}
-                  </option>
-                ))}
-            </select>
-
-            <select
-              disabled={isReadOnly}
-              value={task.status}
-              onChange={(e) =>
-                onUpdateTask({
-                  ...task,
-                  status: e.target.value as PlanoraTask['status'],
-                })
-              }
-              className="px-2 py-1 text-xs bg-white border border-slate-200 rounded-md font-medium"
-            >
-              <option value="Todo">Todo</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Completed">Completed</option>
-            </select>
-          </div>
-        </motion.div>
-
-        {/* Nested Dependent Children */}
-        <AnimatePresence initial={false}>
-          {children.length > 0 && !isCollapsed && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              transition={{ duration: 0.28, ease: 'easeInOut' }}
-              className="pl-7 md:pl-10 mt-2.5 space-y-2.5 relative before:content-[''] before:absolute before:left-3.5 md:before:left-5 before:top-0 before:bottom-4 before:w-px before:bg-slate-300"
-            >
-              {children.map((child) => (
-                <div key={child.id} className="relative">
-                  <div
-                    aria-hidden="true"
-                    className="absolute -left-3.5 md:-left-5 top-6 w-3.5 md:w-5 h-px bg-slate-300"
-                  />
-                  {renderTreeNode(child, level + 1, new Set(visited))}
-                </div>
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-    );
-  };
+  const selectedTask = selectedTaskId ? taskMap.get(selectedTaskId) : undefined;
+  const totalChainCount = tasks.filter((t) => Boolean(t.dependsOnTaskId)).length;
+  const unlinkedCount =
+    tasks.filter((t) => !t.dependsOnTaskId).length > 1
+      ? tasks.filter((t) => !t.dependsOnTaskId).length - 1
+      : 0;
 
   return (
-    <div className="space-y-5">
-      {/* Dependency Intelligence & Control Strip */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <motion.div
-          layout
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25 }}
-          className="bg-white border border-slate-200 rounded-xl p-4"
-        >
-          <div className="text-xs text-slate-500">
-            Ready to Execute (Unblocked)
-          </div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <AnimatePresence mode="popLayout" initial={false}>
-              <motion.span
-                key={stats.readyCount}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
-                transition={{ duration: 0.2 }}
-                className="text-xl font-bold text-[#059669] font-mono tabular-nums"
-              >
-                {stats.readyCount}
-              </motion.span>
-            </AnimatePresence>
-            <span className="text-xs text-slate-500">
-              Prerequisites satisfied
-            </span>
-          </div>
-        </motion.div>
+    <div className="space-y-4">
+      <DagStatsAndToolbar
+        totalChainCount={totalChainCount}
+        maxDepth={dagLayout.maxCol + 1}
+        criticalCount={diagnostics.criticalPathIds.size}
+        blockedCount={diagnostics.blockedTaskIds.size}
+        overdueCount={diagnostics.overdueTaskIds.size}
+        conflictCount={diagnostics.scheduleConflictIds.size}
+        displayMode={displayMode}
+        onSetDisplayMode={setDisplayMode}
+        filterMode={filterMode}
+        onSetFilterMode={setFilterMode}
+        unlinkedCount={unlinkedCount}
+        onAutoInfer={() => {
+          onBulkUpdateTasks(inferLogicalDependencies(tasks));
+          setCycleError(null);
+        }}
+        onAutoResolveConflicts={() => {
+          const { updatedTasks } = autoResolveScheduleConflicts(tasks, 3);
+          onBulkUpdateTasks(updatedTasks);
+          setCycleError(null);
+        }}
+        linkingSourceId={linkingSourceId}
+        linkingSourceTitle={taskMap.get(linkingSourceId || '')?.title}
+        onCancelLinking={() => {
+          setLinkingSourceId(null);
+          setCycleError(null);
+        }}
+        cycleError={cycleError}
+      />
 
-        <motion.div
-          layout
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25, delay: 0.05 }}
-          className={`bg-white border rounded-xl p-4 ${
-            stats.blockedCount > 0 || stats.overdueCount > 0
-              ? 'border-amber-300/90'
-              : 'border-slate-200'
-          }`}
-        >
-          <div className="text-xs text-slate-500">
-            Blocked or Overdue Tasks
-          </div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <AnimatePresence mode="popLayout" initial={false}>
-              <motion.span
-                key={`${stats.blockedCount}-${stats.overdueCount}`}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
-                transition={{ duration: 0.2 }}
-                className={`text-xl font-bold font-mono tabular-nums ${
-                  stats.overdueCount > 0
-                    ? 'text-red-600'
-                    : stats.blockedCount > 0
-                    ? 'text-amber-700'
-                    : 'text-slate-900'
-                }`}
-              >
-                {stats.blockedCount} blocked · {stats.overdueCount} overdue
-              </motion.span>
-            </AnimatePresence>
-            <span className="text-xs text-slate-500">Urgent attention</span>
-          </div>
-        </motion.div>
-
-        <motion.div
-          layout
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25, delay: 0.1 }}
-          className="bg-white border border-slate-200 rounded-xl p-4"
-        >
-          <div className="text-xs text-slate-500">
-            Active Critical Bottlenecks
-          </div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <AnimatePresence mode="popLayout" initial={false}>
-              <motion.span
-                key={stats.bottleneckCount}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
-                transition={{ duration: 0.2 }}
-                className="text-xl font-bold text-[#1E1B4B] font-mono tabular-nums"
-              >
-                {stats.bottleneckCount}
-              </motion.span>
-            </AnimatePresence>
-            <span className="text-xs text-slate-500">
-              Tasks blocking others
-            </span>
-          </div>
-        </motion.div>
-
-        <motion.div
-          layout
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25, delay: 0.15 }}
-          className="bg-white border border-slate-200 rounded-xl p-4"
-        >
-          <div className="text-xs text-slate-500">
-            Dependency Chain Stages
-          </div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <AnimatePresence mode="popLayout" initial={false}>
-              <motion.span
-                key={stats.stageCount}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
-                transition={{ duration: 0.2 }}
-                className="text-xl font-bold text-slate-900 font-mono tabular-nums"
-              >
-                {stats.stageCount} Stages
-              </motion.span>
-            </AnimatePresence>
-            <span className="text-xs font-mono tabular-nums text-slate-500">
-              {criticalPathIds.size} on critical path
-            </span>
-          </div>
-        </motion.div>
+      {/* Visually-hidden accessible text list of task dependencies for screen readers */}
+      <div className="sr-only">
+        <h4>Task Dependency Summary List</h4>
+        <ul>
+          {visibleTasks.map((t) => {
+            const parent = t.dependsOnTaskId ? taskMap.get(t.dependsOnTaskId) : undefined;
+            const isBlocked = diagnostics.blockedTaskIds.has(t.id);
+            const isOverdue = diagnostics.overdueTaskIds.has(t.id);
+            return (
+              <li key={t.id}>
+                {t.title} — Status: {t.status}, Priority: {t.priority}, Due: {t.dueDate}.{' '}
+                {parent ? `Depends on prerequisite: ${parent.title} (${parent.status}).` : 'Root milestone (no prerequisite).'}{' '}
+                {isBlocked ? 'Currently blocked.' : ''} {isOverdue ? 'Currently overdue.' : ''}
+              </li>
+            );
+          })}
+        </ul>
       </div>
 
-      {/* Topology Mode Switcher & Filter Toolbar */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center p-1 bg-slate-100 rounded-lg">
-            <button
-              type="button"
-              onClick={() => setSubMode('graph')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
-                subMode === 'graph'
-                  ? 'bg-[#1E1B4B] text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Network className="w-3.5 h-3.5" />
-              <span>Directed Dependency Graph</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setSubMode('tree')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
-                subMode === 'tree'
-                  ? 'bg-[#1E1B4B] text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <GitBranch className="w-3.5 h-3.5" />
-              <span>Hierarchical Blocker Tree</span>
-            </button>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
-            {(
-              [
-                { id: 'all', label: 'All Nodes' },
-                { id: 'blocked', label: `Blocked (${stats.blockedCount})` },
-                { id: 'overdue', label: `Overdue (${stats.overdueCount})` },
-                {
-                  id: 'bottlenecks',
-                  label: `Bottlenecks (${stats.bottleneckCount})`,
-                },
-                { id: 'ready', label: `Ready (${stats.readyCount})` },
-              ] as const
-            ).map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setDependencyFilter(f.id)}
-                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
-                  dependencyFilter === f.id
-                    ? 'bg-white text-[#1E1B4B] shadow-xs font-semibold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                {f.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-4 text-xs">
-          <label className="inline-flex items-center gap-2 cursor-pointer text-slate-700 font-medium">
-            <input
-              type="checkbox"
-              checked={highlightCriticalPath}
-              onChange={(e) => setHighlightCriticalPath(e.target.checked)}
-              className="rounded border-slate-300 text-[#1E1B4B]"
-            />
-            <span>Highlight Critical Path</span>
-          </label>
-
-          <div className="flex items-center gap-3 text-slate-500">
-            <span className="inline-flex items-center gap-1.5">
-              <span className="w-4 h-0.5 bg-[#059669] inline-block" />
-              <span>Unlocked</span>
-            </span>
-            <span className="inline-flex items-center gap-1.5">
-              <span className="w-4 h-0.5 bg-amber-600 border-b border-dashed border-amber-600 inline-block" />
-              <span>Blocking</span>
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* MODE 1: VISUAL DIRECTED DEPENDENCY GRAPH CANVAS */}
-      {subMode === 'graph' && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5 overflow-x-auto">
-          <div className="flex items-center justify-between gap-4">
-            <div className="text-xs text-slate-500">
-              Blocked and overdue task nodes gently pulse to highlight items needing urgent action. Click any node’s status icon to complete prerequisites and unlock downstream tasks.
-            </div>
-            {selectedTaskId && (
-              <button
-                type="button"
-                onClick={() => setSelectedTaskId(null)}
-                className="text-xs font-medium text-[#1E1B4B] hover:underline shrink-0"
-              >
-                Clear Selection
-              </button>
-            )}
-          </div>
-
-          <LayoutGroup id="dependency-graph-canvas">
+      <AnimatePresence mode="wait">
+        {displayMode === 'dag' ? (
+          <motion.div
+            key="dag-canvas"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.25 }}
+            className="bg-[#FAF7F2] border border-[#E6DFD3] rounded-2xl overflow-x-auto shadow-inner relative"
+          >
             <div
-              ref={containerRef}
-              className="relative min-w-[780px] py-2"
-              onMouseLeave={() => setHoveredTaskId(null)}
+              className="relative"
+              style={{
+                width: `${dagLayout.canvasWidth}px`,
+                height: `${dagLayout.canvasHeight}px`,
+              }}
             >
-              {/* Animated SVG Bézier Dependency Connector Layer */}
               <svg
-                className="absolute inset-0 w-full h-full pointer-events-none z-0"
-                style={{ overflow: 'visible' }}
+                width={dagLayout.canvasWidth}
+                height={dagLayout.canvasHeight}
+                role="img"
+                aria-labelledby={`${svgTitleId} ${svgDescId}`}
+                className="absolute inset-0 pointer-events-none"
               >
+                <title id={svgTitleId}>Task Dependency Directed Acyclic Graph</title>
+                <desc id={svgDescId}>
+                  Visualizes {visibleTasks.length} tasks and {dagLayout.edges.length} dependency links across {dagLayout.maxCol + 1} stages.
+                </desc>
                 <defs>
-                  <marker
-                    id="arrow-unlocked"
-                    viewBox="0 0 10 10"
-                    refX="7"
-                    refY="5"
-                    markerWidth="6"
-                    markerHeight="6"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 1 L 8 5 L 0 9 z" fill="#34D399" />
+                  <marker id={`${uid}-arrow-normal`} markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                    <path d="M0,0 L0,9 L8,4.5 z" fill="#34D399" />
                   </marker>
-                  <marker
-                    id="arrow-blocking"
-                    viewBox="0 0 10 10"
-                    refX="7"
-                    refY="5"
-                    markerWidth="6"
-                    markerHeight="6"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 1 L 8 5 L 0 9 z" fill="#FBBF24" />
+                  <marker id={`${uid}-arrow-blocked`} markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                    <path d="M0,0 L0,9 L8,4.5 z" fill="#F87171" />
                   </marker>
-                  <marker
-                    id="arrow-critical"
-                    viewBox="0 0 10 10"
-                    refX="7"
-                    refY="5"
-                    markerWidth="6"
-                    markerHeight="6"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 1 L 8 5 L 0 9 z" fill="#22D3EE" />
+                  <marker id={`${uid}-arrow-critical`} markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                    <path d="M0,0 L0,9 L8,4.5 z" fill="#FBBF24" />
                   </marker>
                 </defs>
-
-                <AnimatePresence>
-                  {edges.map((edge) => {
-                    const dx = Math.max(48, Math.abs(edge.x2 - edge.x1) * 0.48);
-                    const d = `M ${edge.x1} ${edge.y1} C ${edge.x1 + dx} ${
-                      edge.y1
-                    }, ${edge.x2 - dx} ${edge.y2}, ${edge.x2} ${edge.y2}`;
-
-                    const isFocusedEdge =
-                      !connectedLineageIds ||
-                      (connectedLineageIds.has(edge.fromId) &&
-                        connectedLineageIds.has(edge.toId));
-
-                    const strokeColor = !edge.isBlocking
-                      ? '#34D399'
-                      : highlightCriticalPath && edge.isCriticalPath
-                      ? '#22D3EE'
-                      : '#FBBF24';
-
-                    const markerId = !edge.isBlocking
-                      ? 'url(#arrow-unlocked)'
-                      : highlightCriticalPath && edge.isCriticalPath
-                      ? 'url(#arrow-critical)'
-                      : 'url(#arrow-blocking)';
-
-                    return (
-                      <motion.g
-                        key={edge.id}
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: isFocusedEdge ? 1 : 0.16 }}
-                        exit={{ opacity: 0 }}
-                        transition={{ duration: 0.25 }}
-                      >
-                        {(activeFocusId ||
-                          transientHighlights[edge.toId] ||
-                          transientHighlights[edge.fromId]) &&
-                          isFocusedEdge && (
-                            <path
-                              d={d}
-                              fill="none"
-                              stroke={strokeColor}
-                              strokeWidth={7}
-                              strokeOpacity={0.16}
-                            />
-                          )}
-
-                        <motion.path
-                          d={d}
-                          fill="none"
-                          stroke={strokeColor}
-                          strokeWidth={
-                            highlightCriticalPath && edge.isCriticalPath
-                              ? 2.5
-                              : 2
-                          }
-                          strokeDasharray={edge.isBlocking ? '6 5' : undefined}
-                          markerEnd={markerId}
-                          initial={{ pathLength: 0, opacity: 0 }}
-                          animate={{
-                            pathLength: 1,
-                            opacity: 1,
-                            stroke: strokeColor,
-                          }}
-                          transition={{ duration: 0.35, ease: 'easeOut' }}
-                        />
-
-                        <circle r="3" fill={strokeColor}>
-                          <animateMotion
-                            dur={edge.isBlocking ? '3.2s' : '2.2s'}
-                            repeatCount="indefinite"
-                            path={d}
-                          />
-                        </circle>
-                      </motion.g>
-                    );
-                  })}
-                </AnimatePresence>
+                {dagLayout.edges.map((edge) => {
+                  const strokeColor =
+                    edge.isConflictEdge || edge.isBlockedEdge
+                      ? '#F87171'
+                      : edge.isCriticalEdge
+                      ? '#FBBF24'
+                      : '#34D399';
+                  const markerId =
+                    edge.isConflictEdge || edge.isBlockedEdge
+                      ? `${uid}-arrow-blocked`
+                      : edge.isCriticalEdge
+                      ? `${uid}-arrow-critical`
+                      : `${uid}-arrow-normal`;
+                  return (
+                    <path
+                      key={edge.id}
+                      d={edge.path}
+                      fill="none"
+                      stroke={strokeColor}
+                      strokeWidth={2.2}
+                      strokeDasharray={edge.isBlockedEdge ? '6 4' : undefined}
+                      markerEnd={`url(#${markerId})`}
+                    />
+                  );
+                })}
               </svg>
 
-              {/* Stage Columns Grid */}
-              <motion.div
-                layout
-                transition={NODE_SPRING}
-                className="relative z-10 grid gap-8 items-start"
-                style={{
-                  gridTemplateColumns: `repeat(${Math.max(
-                    1,
-                    stages.length
-                  )}, minmax(240px, 1fr))`,
-                }}
-              >
-                {stages.map((stageTasks, stageIdx) => (
+              {/* Focusable Interactive Task Nodes */}
+              {visibleTasks.map((task) => {
+                const pos = dagLayout.positions.get(task.id);
+                if (!pos) return null;
+
+                const isBlocked = diagnostics.blockedTaskIds.has(task.id);
+                const isOverdue = diagnostics.overdueTaskIds.has(task.id);
+                const isConflict = diagnostics.scheduleConflictIds.has(task.id);
+                const isCritical = diagnostics.criticalPathIds.has(task.id);
+                const isSelected = selectedTaskId === task.id;
+                const isUrgent = isBlocked || isOverdue || isConflict;
+                const isDimmed =
+                  activeHighlightChain.size > 0 && !activeHighlightChain.has(task.id);
+                const parentTask = task.dependsOnTaskId
+                  ? taskMap.get(task.dependsOnTaskId)
+                  : undefined;
+
+                return (
                   <motion.div
-                    key={`stage-col-${stageIdx}`}
-                    layout="position"
-                    transition={NODE_SPRING}
-                    className="space-y-4"
+                    key={task.id}
+                    layout
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${task.title}, status ${task.status}, priority ${task.priority}, due ${task.dueDate}${
+                      parentTask ? `, depends on ${parentTask.title}` : ', root milestone'
+                    }${isBlocked ? ', blocked' : ''}${isOverdue ? ', overdue' : ''}`}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        handleNodeActivate(task);
+                      }
+                    }}
+                    onMouseEnter={() => setHoveredTaskId(task.id)}
+                    onMouseLeave={() => setHoveredTaskId(null)}
+                    onClick={() => handleNodeActivate(task)}
+                    style={{
+                      position: 'absolute',
+                      left: pos.x,
+                      top: pos.y,
+                      width: NODE_WIDTH,
+                      height: NODE_HEIGHT,
+                      opacity: isDimmed ? 0.35 : 1,
+                    }}
+                    className={`rounded-2xl p-3.5 cursor-pointer transition-colors flex flex-col justify-between border ${
+                      isSelected
+                        ? 'bg-white border-2 border-[#22D3EE] shadow-lg ring-4 ring-[#22D3EE]/15'
+                        : isUrgent
+                        ? 'bg-white border-2 border-[#F87171] shadow-sm'
+                        : isCritical
+                        ? 'bg-white border-2 border-[#FBBF24] shadow-sm'
+                        : 'bg-white border border-[#E6DFD3]'
+                    }`}
                   >
-                    <div className="pb-2 border-b border-slate-200 flex items-center justify-between text-xs">
-                      <span className="font-bold text-[#1E1B4B] font-display">
-                        0{stageIdx + 1}.{' '}
-                        {stageIdx === 0
-                          ? 'Foundation Prerequisites'
-                          : stageIdx === stages.length - 1 && stages.length > 1
-                          ? 'Final Execution Milestones'
-                          : `Stage ${stageIdx + 1} Dependents`}
-                      </span>
-                      <span className="font-mono tabular-nums text-slate-500">
-                        {stageTasks.length}
-                      </span>
+                    {isUrgent && (
+                      <motion.div
+                        aria-hidden="true"
+                        className="absolute inset-0 rounded-2xl pointer-events-none border-2 border-[#F87171]"
+                        animate={{
+                          scale: [1, 1.03, 1],
+                          opacity: [0.55, 0.15, 0.55],
+                        }}
+                        transition={{
+                          duration: 2.2,
+                          repeat: Infinity,
+                          ease: 'easeInOut',
+                        }}
+                      />
+                    )}
+
+                    <div className="flex items-center justify-between gap-1.5 relative z-10">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onToggleTaskStatus(task.id);
+                          }}
+                          aria-label={`Cycle status for ${task.title}, current status ${task.status}`}
+                          className="shrink-0 p-0.5 rounded hover:bg-[#FAF7F2]"
+                        >
+                          {task.status === 'Done' ? (
+                            <CheckCircle2 className="w-4 h-4 text-[#34D399]" aria-hidden="true" />
+                          ) : task.status === 'In Progress' ? (
+                            <Clock className="w-4 h-4 text-[#FBBF24]" aria-hidden="true" />
+                          ) : (
+                            <Circle className="w-4 h-4 text-[#CBD5E1]" aria-hidden="true" />
+                          )}
+                        </button>
+                        <span className="text-xs font-mono uppercase tracking-wider px-1.5 py-0.5 rounded bg-[#F3EFE6] text-[#6E655A] truncate">
+                          {task.category}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        {isBlocked && (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#A63A2B]/15 text-[#F87171] text-xs font-bold">
+                            <Lock className="w-3 h-3" aria-hidden="true" /> Blocked
+                          </span>
+                        )}
+                        {!isBlocked && isCritical && (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#B8860B]/15 text-[#FBBF24] text-xs font-bold">
+                            <Flame className="w-3 h-3" aria-hidden="true" /> Critical
+                          </span>
+                        )}
+                      </div>
                     </div>
 
-                    <div className="space-y-4">
-                      {stageTasks.map((task) => {
-                        const prereq = task.dependsOnTaskId
-                          ? taskMap.get(task.dependsOnTaskId)
-                          : undefined;
-                        const isBlocked = Boolean(
-                          prereq && prereq.status !== 'Completed'
-                        );
-                        const isOverdue =
-                          task.status !== 'Completed' &&
-                          task.dueDate < todayIso;
-                        const needsUrgentPulse =
-                          task.status !== 'Completed' &&
-                          (isOverdue || isBlocked);
-                        const directChildren = childrenMap.get(task.id) || [];
-                        const totalDownstream =
-                          downstreamCountMap.get(task.id) || 0;
-                        const isInLineage =
-                          !connectedLineageIds ||
-                          connectedLineageIds.has(task.id);
-                        const isFilterMatch = matchesFilter(task);
-                        const isOnCritPath =
-                          highlightCriticalPath && criticalPathIds.has(task.id);
-                        const highlightState = transientHighlights[task.id];
+                    <div className="my-1 relative z-10">
+                      <p
+                        className={`text-xs font-bold leading-snug line-clamp-2 ${
+                          task.status === 'Done'
+                            ? 'line-through text-[#94A3B8]'
+                            : 'text-[#1F1C18]'
+                        }`}
+                      >
+                        {task.title}
+                      </p>
+                    </div>
 
-                        const targetBg =
-                          selectedTaskId === task.id
-                            ? '#FFFFFF'
-                            : highlightState === 'unlocked' ||
-                              highlightState === 'status'
-                            ? '#ECFDF5'
-                            : highlightState === 'connection'
-                            ? '#EEF2FF'
-                            : isOverdue
-                            ? '#FEF2F2'
-                            : isBlocked && task.status !== 'Completed'
-                            ? '#FFFBEB'
-                            : '#FFFFFF';
-
-                        const targetBorder =
-                          selectedTaskId === task.id
-                            ? '#1E1B4B'
-                            : highlightState === 'unlocked' ||
-                              highlightState === 'status'
-                            ? '#059669'
-                            : highlightState === 'connection'
-                            ? '#4F46E5'
-                            : isOverdue
-                            ? '#FCA5A5'
-                            : isBlocked && task.status !== 'Completed'
-                            ? '#FCD34D'
-                            : task.status === 'Completed'
-                            ? '#6EE7B7'
-                            : isOnCritPath
-                            ? '#1E1B4B'
-                            : '#E2E8F0';
-
-                        return (
-                          <motion.div
-                            key={task.id}
-                            layoutId={`graph-node-${task.id}`}
-                            layout
-                            ref={(el) => {
-                              nodeRefs.current[task.id] = el;
-                            }}
-                            onLayoutAnimationStart={() => {
-                              requestAnimationFrame(recomputeEdges);
-                            }}
-                            onLayoutAnimationComplete={recomputeEdges}
-                            initial={{ opacity: 0, y: 14, scale: 0.96 }}
-                            animate={{
-                              opacity:
-                                isInLineage && isFilterMatch
-                                  ? 1
-                                  : isFilterMatch
-                                  ? 0.3
-                                  : 0.2,
-                              y: 0,
-                              scale:
-                                selectedTaskId === task.id
-                                  ? 1.02
-                                  : highlightState
-                                  ? 1.025
-                                  : 1,
-                              backgroundColor: targetBg,
-                              borderColor: targetBorder,
-                            }}
-                            whileHover={{ y: -3 }}
-                            transition={NODE_SPRING}
-                            onMouseEnter={() => setHoveredTaskId(task.id)}
-                            onClick={() =>
-                              setSelectedTaskId((prev) =>
-                                prev === task.id ? null : task.id
-                              )
-                            }
-                            className={`relative p-4 rounded-xl border cursor-pointer transition-shadow space-y-2.5 ${
-                              selectedTaskId === task.id
-                                ? 'shadow-lg ring-2 ring-[#1E1B4B]/15'
-                                : highlightState
-                                ? 'shadow-md ring-2 ring-emerald-500/20'
-                                : isOverdue
-                                ? 'task-pulse-overdue hover:shadow-md'
-                                : isBlocked && task.status !== 'Completed'
-                                ? 'task-pulse-blocked hover:shadow-md'
-                                : 'hover:shadow-md'
-                            }`}
-                          >
-                            {/* Top Metadata Row */}
-                            <div className="flex items-center justify-between gap-2 text-xs font-mono tabular-nums">
-                              <span
-                                className={
-                                  isOverdue
-                                    ? 'text-red-700 font-semibold'
-                                    : 'text-slate-500'
-                                }
-                              >
-                                {task.dueDate}
-                                {isOverdue ? ' · Overdue' : ` · ${task.category}`}
-                              </span>
-                              <motion.button
-                                type="button"
-                                whileHover={{ scale: 1.06 }}
-                                whileTap={{ scale: 0.9 }}
-                                animate={
-                                  needsUrgentPulse
-                                    ? { scale: [1, 1.07, 1] }
-                                    : { scale: 1 }
-                                }
-                                transition={
-                                  needsUrgentPulse
-                                    ? {
-                                        duration: 2.2,
-                                        repeat: Infinity,
-                                        ease: 'easeInOut',
-                                      }
-                                    : { duration: 0.2 }
-                                }
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  cycleTaskStatus(task);
-                                }}
-                                title="Click to cycle task status"
-                                className={`inline-flex items-center gap-1 font-sans font-semibold transition-colors duration-200 ${
-                                  task.status === 'Completed'
-                                    ? 'text-[#059669]'
-                                    : isOverdue
-                                    ? 'text-red-600'
-                                    : isBlocked
-                                    ? 'text-amber-700'
-                                    : 'text-[#1E1B4B]'
-                                }`}
-                              >
-                                <AnimatePresence mode="wait" initial={false}>
-                                  <motion.span
-                                    key={`${task.status}-${
-                                      isOverdue
-                                        ? 'overdue'
-                                        : isBlocked
-                                        ? 'blocked'
-                                        : 'open'
-                                    }`}
-                                    initial={{
-                                      scale: 0.6,
-                                      opacity: 0,
-                                      rotate: -20,
-                                    }}
-                                    animate={{
-                                      scale: 1,
-                                      opacity: 1,
-                                      rotate: 0,
-                                    }}
-                                    exit={{
-                                      scale: 0.6,
-                                      opacity: 0,
-                                      rotate: 20,
-                                    }}
-                                    transition={{ duration: 0.16 }}
-                                    className="inline-flex items-center gap-1"
-                                  >
-                                    {task.status === 'Completed' ? (
-                                      <CheckCircle2 className="w-3.5 h-3.5" />
-                                    ) : isOverdue ? (
-                                      <AlertTriangle className="w-3.5 h-3.5" />
-                                    ) : isBlocked ? (
-                                      <Lock className="w-3.5 h-3.5" />
-                                    ) : (
-                                      <Clock className="w-3.5 h-3.5" />
-                                    )}
-                                    <span>{task.status}</span>
-                                  </motion.span>
-                                </AnimatePresence>
-                              </motion.button>
-                            </div>
-
-                            {/* Task Title */}
-                            <h4
-                              className={`text-xs font-bold font-display leading-snug transition-colors duration-200 ${
-                                task.status === 'Completed'
-                                  ? 'line-through text-slate-500'
-                                  : 'text-slate-900'
-                              }`}
-                            >
-                              {task.title}
-                            </h4>
-
-                            {/* Dependency Status Line with smooth crossfade */}
-                            <div className="pt-2 border-t border-slate-100 flex flex-col gap-1.5 text-xs">
-                              <AnimatePresence mode="wait" initial={false}>
-                                {prereq ? (
-                                  <motion.div
-                                    key={`${prereq.id}-${
-                                      isBlocked ? 'blocked' : 'unlocked'
-                                    }`}
-                                    initial={{ opacity: 0, y: 3 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    exit={{ opacity: 0, y: -3 }}
-                                    transition={{ duration: 0.18 }}
-                                    className={
-                                      isBlocked
-                                        ? 'text-amber-800 font-medium'
-                                        : 'text-emerald-700 font-medium'
-                                    }
-                                  >
-                                    {isBlocked
-                                      ? `Blocked by: ${prereq.title.slice(
-                                          0,
-                                          28
-                                        )}...`
-                                      : `Unlocked by: ${prereq.title.slice(
-                                          0,
-                                          28
-                                        )}...`}
-                                  </motion.div>
-                                ) : (
-                                  <motion.div
-                                    key="root-prereq"
-                                    initial={{ opacity: 0, y: 3 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    exit={{ opacity: 0, y: -3 }}
-                                    transition={{ duration: 0.18 }}
-                                    className="text-slate-500"
-                                  >
-                                    Root task (No upstream blocker)
-                                  </motion.div>
-                                )}
-                              </AnimatePresence>
-
-                              <div className="flex items-center justify-between text-slate-500 font-mono tabular-nums">
-                                <span className="truncate max-w-[120px]">
-                                  {task.assignee || 'Organizer'}
-                                </span>
-                                {directChildren.length > 0 && (
-                                  <span
-                                    className={
-                                      task.status === 'Completed'
-                                        ? 'text-emerald-700 font-semibold'
-                                        : 'text-[#1E1B4B] font-semibold'
-                                    }
-                                  >
-                                    {task.status === 'Completed'
-                                      ? `Unlocks ${totalDownstream}`
-                                      : `Blocks ${totalDownstream}`}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          </motion.div>
-                        );
-                      })}
+                    <div className="flex items-center justify-between pt-1.5 border-t border-[#E6DFD3] text-xs text-[#6E655A] relative z-10">
+                      <span className="font-mono flex items-center gap-1">
+                        <Calendar className="w-3 h-3 text-[#B8860B]" aria-hidden="true" />
+                        {task.dueDate}
+                      </span>
+                      <span className="font-mono">{task.priority}</span>
                     </div>
                   </motion.div>
-                ))}
-              </motion.div>
+                );
+              })}
             </div>
-          </LayoutGroup>
+          </motion.div>
+        ) : (
+          <DagTreeView
+            rootTasks={treeRoots.roots}
+            childrenByParentId={treeRoots.childrenByParentId}
+            diagnostics={diagnostics}
+            selectedTaskId={selectedTaskId}
+            collapsedTreeIds={collapsedTreeIds}
+            onSelectTask={(id) =>
+              setSelectedTaskId((prev) => (prev === id ? null : id))
+            }
+            onToggleStatus={onToggleTaskStatus}
+            onToggleCollapse={(id) =>
+              setCollapsedTreeIds((prev) => {
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id);
+                else next.add(id);
+                return next;
+              })
+            }
+          />
+        )}
+      </AnimatePresence>
 
-          {/* Interactive Selected Node Inspector Drawer */}
-          <AnimatePresence>
-            {selectedTask && (
-              <motion.div
-                layout
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 12 }}
-                transition={{ duration: 0.22 }}
-                className="p-5 bg-[#FAF8F5] border border-slate-200 rounded-xl space-y-4"
-              >
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="text-xs text-slate-500 font-mono tabular-nums">
-                      Selected Node Inspector · Due {selectedTask.dueDate} ·{' '}
-                      {selectedTask.priority} Priority
-                    </div>
-                    <h4 className="text-base font-bold text-[#1E1B4B] font-display mt-0.5">
-                      {selectedTask.title}
-                    </h4>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <select
-                      disabled={isReadOnly}
-                      value={selectedTask.dependsOnTaskId}
-                      onChange={(e) =>
-                        onUpdateTask({
-                          ...selectedTask,
-                          dependsOnTaskId: e.target.value,
-                        })
-                      }
-                      className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-lg"
-                    >
-                      <option value="">No Prerequisite (Root Task)</option>
-                      {tasks
-                        .filter(
-                          (cand) =>
-                            cand.id !== selectedTask.id &&
-                            !wouldCreateCycle(selectedTask.id, cand.id)
-                        )
-                        .map((cand) => (
-                          <option key={cand.id} value={cand.id}>
-                            Depends on: {cand.title.slice(0, 36)}
-                          </option>
-                        ))}
-                    </select>
-
-                    <select
-                      disabled={isReadOnly}
-                      value={selectedTask.status}
-                      onChange={(e) =>
-                        onUpdateTask({
-                          ...selectedTask,
-                          status: e.target.value as PlanoraTask['status'],
-                        })
-                      }
-                      className="px-2.5 py-1.5 text-xs font-medium bg-white border border-slate-300 rounded-lg"
-                    >
-                      <option value="Todo">Todo</option>
-                      <option value="In Progress">In Progress</option>
-                      <option value="Completed">Completed</option>
-                    </select>
-
-                    {!isReadOnly && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onDeleteTask(selectedTask.id);
-                          setSelectedTaskId(null);
-                        }}
-                        className="p-1.5 text-slate-400 hover:text-red-600 rounded-lg"
-                        title="Delete task"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-2 border-t border-slate-200">
-                  <div>
-                    <span className="font-semibold text-slate-900">
-                      Upstream Prerequisite:
-                    </span>{' '}
-                    {selectedTask.dependsOnTaskId &&
-                    taskMap.has(selectedTask.dependsOnTaskId) ? (
-                      <span className="text-slate-700">
-                        “{taskMap.get(selectedTask.dependsOnTaskId)!.title}” (
-                        {taskMap.get(selectedTask.dependsOnTaskId)!.status})
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">
-                        None — this task can start immediately.
-                      </span>
-                    )}
-                  </div>
-                  <div>
-                    <span className="font-semibold text-slate-900">
-                      Directly Blocks (
-                      {(childrenMap.get(selectedTask.id) || []).length}):
-                    </span>{' '}
-                    {(childrenMap.get(selectedTask.id) || []).length > 0 ? (
-                      <span className="text-slate-700">
-                        {(childrenMap.get(selectedTask.id) || [])
-                          .map((c) => c.title)
-                          .join(' · ')}
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">
-                        Terminal milestone — no downstream tasks waiting on this.
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {/* MODE 2: COLLAPSIBLE HIERARCHICAL DEPENDENCY TREE VIEW */}
-      {subMode === 'tree' && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-200">
-            <div>
-              <h3 className="text-sm font-bold text-[#1E1B4B] font-display">
-                Hierarchical Task Dependency Tree
-              </h3>
-              <p className="text-xs text-slate-500">
-                Parent milestones expand to reveal every downstream task they unlock. Reassign prerequisites or toggle completion inline.
-              </p>
-            </div>
-            <div className="flex items-center gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setCollapsedNodes({})}
-                className="px-2.5 py-1 text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md font-medium"
-              >
-                Expand All
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const allCollapsed: Record<string, boolean> = {};
-                  tasks.forEach((t) => {
-                    if ((childrenMap.get(t.id) || []).length > 0) {
-                      allCollapsed[t.id] = true;
-                    }
-                  });
-                  setCollapsedNodes(allCollapsed);
-                }}
-                className="px-2.5 py-1 text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md font-medium"
-              >
-                Collapse Branches
-              </button>
-            </div>
-          </div>
-
-          <LayoutGroup id="dependency-tree-canvas">
-            <motion.div layout className="space-y-3">
-              {rootTasks.map((root) => renderTreeNode(root, 0))}
-            </motion.div>
-          </LayoutGroup>
-        </div>
+      {selectedTask && (
+        <DagNodeInspector
+          selectedTask={selectedTask}
+          tasks={tasks}
+          diagnostics={diagnostics}
+          linkingSourceId={linkingSourceId}
+          onToggleLinkingSource={(id) =>
+            setLinkingSourceId((prev) => (prev === id ? null : id))
+          }
+          onToggleStatus={onToggleTaskStatus}
+          onSetDependency={(taskId, parentId) => {
+            onSetTaskDependency(taskId, parentId);
+            setCycleError(null);
+          }}
+          onSelectTask={setSelectedTaskId}
+          onClose={() => setSelectedTaskId(null)}
+        />
       )}
     </div>
   );
-});
+};

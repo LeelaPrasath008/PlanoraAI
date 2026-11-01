@@ -1,227 +1,217 @@
-import React, { useState } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
-import { BudgetExpenseItem, CurrencyCode, formatCurrency } from '../types/event';
+import React, { useId, useMemo } from 'react';
+import { CategorySummary, formatCurrency } from '../utils/budgetCalculations';
 
-interface BudgetDonutChartProps {
-  items: BudgetExpenseItem[];
-  totalBudget: number;
-  contingencyPercent: number;
-  currency: CurrencyCode;
+export interface BudgetDonutChartProps {
+  categories: CategorySummary[];
+  totalPlanned: number;
+  selectedCategory: string | null;
+  onSelectCategory: (category: string | null) => void;
 }
 
-const SLICE_COLORS = [
-  '#22D3EE', // Laser Cyan
-  '#818CF8', // Nebula Indigo
-  '#34D399', // Aurora Emerald
+const CHART_COLORS = [
+  '#38BDF8', // Cyan Sky
+  '#34D399', // Cosmic Emerald
   '#FBBF24', // Solar Amber
-  '#38BDF8', // Orbital Sky
-  '#A78BFA', // Cosmic Violet
-  '#F472B6', // Supernova Rose
-  '#2DD4BF', // Ion Teal
+  '#F87171', // Nova Coral
+  '#A78BFA', // Nebula Violet
+  '#60A5FA', // Starlight Blue
+  '#F472B6', // Pulsar Rose
+  '#2DD4BF', // Aurora Teal
+  '#FB923C', // Comet Orange
+  '#94A3B8', // Asteroid Slate
 ];
 
-export const BudgetDonutChart: React.FC<BudgetDonutChartProps> = ({
-  items,
-  totalBudget,
-  contingencyPercent,
-  currency,
+/**
+ * Accessible SVG Budget Donut Chart with interactive category slices,
+ * SVG <title>/<desc> labelled via aria-labelledby, and a visually-hidden
+ * data table for screen reader users.
+ */
+export const BudgetDonutChart: React.FC<BudgetDonutChartProps> = React.memo(({
+  categories,
+  totalPlanned,
+  selectedCategory,
+  onSelectCategory,
 }) => {
-  const [hoveredCategory, setHoveredCategory] = useState<string | null>(null);
+  const chartId = useId();
+  const titleId = `${chartId}-title`;
+  const descId = `${chartId}-desc`;
 
-  // Aggregate by category in application code
-  const categoryMap = new Map<
-    string,
-    { planned: number; quoted: number; actual: number }
-  >();
-  for (const item of items) {
-    const cat = item.category || 'Other';
-    const prev = categoryMap.get(cat) || { planned: 0, quoted: 0, actual: 0 };
-    categoryMap.set(cat, {
-      planned: prev.planned + (Number(item.plannedAmount) || 0),
-      quoted: prev.quoted + (Number(item.quotedAmount) || 0),
-      actual: prev.actual + (Number(item.actualAmount) || 0),
-    });
-  }
-
-  const contingencyReserve = Math.round(
-    totalBudget * (Math.max(0, contingencyPercent) / 100)
-  );
-  if (contingencyReserve > 0) {
-    categoryMap.set('Contingency Reserve', {
-      planned: contingencyReserve,
-      quoted: contingencyReserve,
-      actual: 0,
-    });
-  }
-
-  const categories = Array.from(categoryMap.entries()).map(
-    ([name, vals], idx) => ({
-      name,
-      ...vals,
-      color: SLICE_COLORS[idx % SLICE_COLORS.length],
-    })
-  );
-
-  const totalPlannedWithContingency = categories.reduce(
-    (s, c) => s + c.planned,
-    0
-  );
-  const denominator = Math.max(1, totalPlannedWithContingency, totalBudget);
-
-  // Build SVG Donut arcs
-  const radius = 72;
+  const size = 210;
+  const strokeWidth = 28;
+  const center = size / 2;
+  const radius = center - strokeWidth;
   const circumference = 2 * Math.PI * radius;
-  let cumulativePercent = 0;
 
-  const slices = categories.map((cat) => {
-    const pct = cat.planned / denominator;
-    const strokeDasharray = `${pct * circumference} ${circumference}`;
-    const strokeDashoffset = -cumulativePercent * circumference;
-    cumulativePercent += pct;
-    return {
-      ...cat,
-      pct,
-      strokeDasharray,
-      strokeDashoffset,
-    };
-  });
+  const slices = useMemo(() => {
+    const safeTotal = totalPlanned > 0 ? totalPlanned : 1;
+    return categories.reduce<
+      Array<
+        CategorySummary & {
+          color: string;
+          fraction: number;
+          dashArray: string;
+          dashOffset: number;
+        }
+      >
+    >((acc, cat, idx) => {
+      const prevCumulative =
+        acc.length > 0
+          ? acc.reduce((sum, item) => sum + item.fraction, 0)
+          : 0;
+      const fraction = Math.max(0, cat.planned) / safeTotal;
+      const dashLength = Math.max(0, fraction * circumference - 2);
+      const dashOffset = -prevCumulative * circumference;
+      acc.push({
+        ...cat,
+        color: CHART_COLORS[idx % CHART_COLORS.length],
+        fraction,
+        dashArray: `${dashLength} ${circumference}`,
+        dashOffset,
+      });
+      return acc;
+    }, []);
+  }, [categories, totalPlanned, circumference]);
 
-  const activeSlice = slices.find((s) => s.name === hoveredCategory) || null;
+  const activeSlice = slices.find((s) => s.category === selectedCategory);
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.35 }}
-      className="bg-white border border-slate-200 rounded-xl p-5 grid grid-cols-1 md:grid-cols-12 gap-6 items-center"
-    >
-      {/* Left 5 Cols: Interactive SVG Donut Chart */}
-      <div className="md:col-span-5 flex flex-col items-center justify-center">
-        <div className="relative w-48 h-48 flex items-center justify-center">
-          <svg
-            viewBox="0 0 180 180"
-            className="w-full h-full -rotate-90 transform"
-            role="img"
-            aria-label="Budget allocation donut chart"
-          >
-            <circle
-              cx="90"
-              cy="90"
-              r={radius}
-              fill="transparent"
-              stroke="#16213A"
-              strokeWidth="22"
-            />
-            {slices.map((slice, idx) => (
-              <motion.circle
-                key={slice.name}
-                cx="90"
-                cy="90"
+    <div className="flex flex-col sm:flex-row items-center gap-6">
+      <div className="relative flex items-center justify-center shrink-0">
+        <svg
+          width={size}
+          height={size}
+          viewBox={`0 0 ${size} ${size}`}
+          className="-rotate-90 transform"
+          role="img"
+          aria-labelledby={`${titleId} ${descId}`}
+        >
+          <title id={titleId}>Budget Allocation Donut Chart</title>
+          <desc id={descId}>
+            Planned budget distribution across {slices.length} categories totaling{' '}
+            {formatCurrency(totalPlanned)}.
+          </desc>
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            fill="transparent"
+            stroke="#1E293B"
+            strokeWidth={strokeWidth}
+          />
+          {slices.map((slice) => {
+            const isSelected = selectedCategory === slice.category;
+            const isDimmed = selectedCategory !== null && !isSelected;
+            return (
+              <circle
+                key={slice.category}
+                cx={center}
+                cy={center}
                 r={radius}
                 fill="transparent"
                 stroke={slice.color}
-                initial={{ strokeDasharray: `0 ${circumference}` }}
-                animate={{
-                  strokeDasharray: slice.strokeDasharray,
-                  strokeDashoffset: slice.strokeDashoffset,
-                  strokeWidth: hoveredCategory === slice.name ? 26 : 22,
+                strokeWidth={isSelected ? strokeWidth + 5 : strokeWidth}
+                strokeDasharray={slice.dashArray}
+                strokeDashoffset={slice.dashOffset}
+                strokeLinecap="butt"
+                style={{
+                  opacity: isDimmed ? 0.35 : 1,
+                  transition:
+                    'stroke-dasharray 0.35s ease, stroke-dashoffset 0.35s ease, stroke-width 0.2s ease, opacity 0.2s ease',
+                  cursor: 'pointer',
                 }}
-                transition={{
-                  duration: 0.55,
-                  delay: idx * 0.05,
-                  ease: 'easeOut',
-                }}
-                className="cursor-pointer"
-                onMouseEnter={() => setHoveredCategory(slice.name)}
-                onMouseLeave={() => setHoveredCategory(null)}
+                onClick={() =>
+                  onSelectCategory(isSelected ? null : slice.category)
+                }
               />
-            ))}
-          </svg>
-          <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-4 pointer-events-none">
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={activeSlice ? activeSlice.name : 'total'}
-                initial={{ opacity: 0, scale: 0.94 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.94 }}
-                transition={{ duration: 0.16 }}
-                className="flex flex-col items-center"
-              >
-                <span className="text-xs text-slate-500 truncate max-w-[120px]">
-                  {activeSlice ? activeSlice.name : 'Total Budget'}
-                </span>
-                <span className="text-sm font-bold text-slate-900 font-mono tabular-nums mt-0.5">
-                  {activeSlice
-                    ? formatCurrency(activeSlice.planned, currency)
-                    : formatCurrency(totalBudget, currency)}
-                </span>
-                <span className="text-xs font-mono tabular-nums text-emerald-700 mt-0.5">
-                  {activeSlice
-                    ? `${Math.round(activeSlice.pct * 100)}% share`
-                    : `${Math.round(
-                        (totalPlannedWithContingency / Math.max(1, totalBudget)) *
-                          100
-                      )}% allocated`}
-                </span>
-              </motion.div>
-            </AnimatePresence>
-          </div>
+            );
+          })}
+        </svg>
+
+        <div className="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none px-6">
+          <span className="text-xs uppercase tracking-widest text-[#CBD5E1] font-semibold truncate max-w-[115px]">
+            {activeSlice ? activeSlice.category : 'Planned Total'}
+          </span>
+          <span className="font-mono text-base font-bold text-[#F8FAFC] mt-0.5">
+            {formatCurrency(activeSlice ? activeSlice.planned : totalPlanned)}
+          </span>
+          <span className="text-xs font-mono text-[#CBD5E1]">
+            {activeSlice
+              ? `${activeSlice.sharePercent.toFixed(1)}% of plan`
+              : `${categories.length} categories`}
+          </span>
         </div>
       </div>
 
-      {/* Right 7 Cols: Category Breakdown Matrix */}
-      <div className="md:col-span-7 space-y-2.5">
-        <div className="flex items-center justify-between text-xs text-slate-500 border-b border-slate-200 pb-2">
-          <span>Category Allocation</span>
-          <span>Planned / Share of Budget</span>
-        </div>
-        <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-          {slices.map((slice, idx) => (
-            <motion.div
-              key={slice.name}
-              initial={{ opacity: 0, x: 10 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ duration: 0.25, delay: idx * 0.04 }}
-              onMouseEnter={() => setHoveredCategory(slice.name)}
-              onMouseLeave={() => setHoveredCategory(null)}
-              className={`p-2 rounded-lg transition-colors cursor-pointer space-y-1.5 text-xs ${
-                hoveredCategory === slice.name
-                  ? 'bg-slate-100'
-                  : 'hover:bg-slate-50'
+      {/* Visually-hidden data table for assistive technologies */}
+      <table className="sr-only">
+        <caption>Budget allocation breakdown by category</caption>
+        <thead>
+          <tr>
+            <th scope="col">Category</th>
+            <th scope="col">Planned Amount</th>
+            <th scope="col">Quoted Amount</th>
+            <th scope="col">Actual Amount</th>
+            <th scope="col">Share of Planned Budget</th>
+          </tr>
+        </thead>
+        <tbody>
+          {slices.map((slice) => (
+            <tr key={slice.category}>
+              <th scope="row">{slice.category}</th>
+              <td>{formatCurrency(slice.planned)}</td>
+              <td>{formatCurrency(slice.quoted)}</td>
+              <td>{formatCurrency(slice.actual)}</td>
+              <td>{slice.sharePercent.toFixed(1)}%</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* Interactive Category Legend */}
+      <div className="flex-1 w-full grid grid-cols-1 gap-1.5">
+        {slices.map((slice) => {
+          const isSelected = selectedCategory === slice.category;
+          return (
+            <button
+              key={slice.category}
+              type="button"
+              onClick={() =>
+                onSelectCategory(isSelected ? null : slice.category)
+              }
+              aria-pressed={isSelected}
+              className={`flex items-center justify-between px-3 py-1.5 rounded-lg text-left transition-all text-xs border min-h-[32px] ${
+                isSelected
+                  ? 'bg-[#FAF7F2] border-[#38BDF8] shadow-xs font-semibold text-[#1F1C18]'
+                  : 'bg-transparent border-transparent hover:bg-[#FAF7F2] text-[#1F1C18]'
               }`}
             >
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <span
-                    className="w-3 h-3 rounded-xs shrink-0"
-                    style={{ backgroundColor: slice.color }}
-                  />
-                  <span className="font-medium text-slate-900 truncate">
-                    {slice.name}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 font-mono tabular-nums shrink-0">
-                  <span className="text-slate-900 font-medium">
-                    {formatCurrency(slice.planned, currency)}
-                  </span>
-                  <span className="text-slate-500 w-10 text-right">
-                    {Math.round(slice.pct * 100)}%
-                  </span>
-                </div>
-              </div>
-              <div className="w-full h-1 bg-slate-200/80 rounded-full overflow-hidden">
-                <motion.div
-                  initial={{ width: 0 }}
-                  animate={{ width: `${Math.min(100, Math.round(slice.pct * 100))}%` }}
-                  transition={{ duration: 0.55, delay: 0.1 + idx * 0.04 }}
-                  className="h-full rounded-full"
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  aria-hidden="true"
+                  className="w-2.5 h-2.5 rounded-full shrink-0"
                   style={{ backgroundColor: slice.color }}
                 />
+                <span className="truncate">{slice.category}</span>
               </div>
-            </motion.div>
-          ))}
-        </div>
+              <div className="flex items-center gap-3 shrink-0 font-mono">
+                <span className="text-[#1F1C18]">{formatCurrency(slice.planned)}</span>
+                <span className="text-[#CBD5E1] w-11 text-right">
+                  {slice.sharePercent.toFixed(0)}%
+                </span>
+              </div>
+            </button>
+          );
+        })}
+        {selectedCategory && (
+          <button
+            type="button"
+            onClick={() => onSelectCategory(null)}
+            className="text-xs text-[#38BDF8] hover:underline text-left px-3 pt-1 font-medium min-h-[28px]"
+          >
+            Clear category filter ({selectedCategory})
+          </button>
+        )}
       </div>
-    </motion.div>
+    </div>
   );
-};
+});
